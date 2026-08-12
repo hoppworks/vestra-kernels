@@ -81,13 +81,14 @@ pub fn linear_f32_da3_base(
 unsafe fn linear_avx512(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
     use core::arch::x86_64::*;
     use rayon::prelude::*;
-    c.par_chunks_mut(4 * n)
+    const ROWS: usize = 5;
+    c.par_chunks_mut(ROWS * n)
         .enumerate()
         .for_each(|(tile, c_tile)| {
-            let row0 = tile * 4;
-            let rows = (m - row0).min(4);
+            let row0 = tile * ROWS;
+            let rows = (m - row0).min(ROWS);
             for col0 in (0..n).step_by(64) {
-                let mut acc = [[_mm512_setzero_ps(); 4]; 4];
+                let mut acc = [[_mm512_setzero_ps(); 4]; ROWS];
                 for row in 0..rows {
                     for block in 0..4 {
                         // SAFETY: all selected rows and 64-column tiles are in bounds.
