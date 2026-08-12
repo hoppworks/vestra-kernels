@@ -98,16 +98,21 @@ unsafe fn flash_attention_avx512(
                             let qv = _mm512_set1_ps(query[dim]);
                             let kp = packed_k[dim].as_ptr();
                             for block in 0..4 {
-                                let kv = _mm512_loadu_ps(kp.add(block * 16));
+                                // SAFETY: the fixed 64-key tile has four full
+                                // sixteen-float blocks; `kp` points into it.
+                                let kv = unsafe { _mm512_loadu_ps(kp.add(block * 16)) };
                                 score_vectors[block] =
                                     _mm512_fmadd_ps(qv, kv, score_vectors[block]);
                             }
                         }
                         for block in 0..4 {
-                            _mm512_storeu_ps(
-                                scores[row].as_mut_ptr().add(block * 16),
-                                score_vectors[block],
-                            );
+                            // SAFETY: score rows are fixed 64-float tiles.
+                            unsafe {
+                                _mm512_storeu_ps(
+                                    scores[row].as_mut_ptr().add(block * 16),
+                                    score_vectors[block],
+                                );
+                            }
                         }
                     }
 
@@ -140,13 +145,15 @@ unsafe fn flash_attention_avx512(
                             let probability = _mm512_set1_ps(scores[row][key]);
                             let value = &v_head[(k0 + key) * D..(k0 + key + 1) * D];
                             for block in 0..4 {
-                                let vv = _mm512_loadu_ps(value.as_ptr().add(block * 16));
+                                // SAFETY: every value row has exactly 64 dims.
+                                let vv = unsafe { _mm512_loadu_ps(value.as_ptr().add(block * 16)) };
                                 result[block] = _mm512_fmadd_ps(probability, vv, result[block]);
                             }
                         }
                         for block in 0..4 {
                             let mut partial = [0.0f32; 16];
-                            _mm512_storeu_ps(partial.as_mut_ptr(), result[block]);
+                            // SAFETY: `partial` has one complete ZMM width.
+                            unsafe { _mm512_storeu_ps(partial.as_mut_ptr(), result[block]) };
                             for lane in 0..16 {
                                 accum[row][block * 16 + lane] += partial[lane];
                             }
