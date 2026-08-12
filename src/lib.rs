@@ -394,7 +394,7 @@ unsafe fn flash_attention_avx512(
     use rayon::prelude::*;
 
     const D: usize = 64;
-    const QT: usize = 64;
+    const QT: usize = 32;
     const KVT: usize = 64;
     const PACKED_TOKENS: usize = 896;
     let scale = 1.0f32 / 8.0;
@@ -591,7 +591,7 @@ unsafe fn gemm_4x64_accumulate_stride(
 #[target_feature(enable = "avx512f,fma")]
 unsafe fn gemm_4x64_accumulate(m: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
     use core::arch::x86_64::*;
-    debug_assert!(m <= 64 && a.len() >= m * 64 && b.len() >= 64 * 64 && c.len() >= m * 64);
+    debug_assert!(m <= 128 && a.len() >= m * 64 && b.len() >= 64 * 64 && c.len() >= m * 64);
     for row0 in (0..m).step_by(4) {
         let rows = (m - row0).min(4);
         let mut acc = [[_mm512_setzero_ps(); 4]; 4];
