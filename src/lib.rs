@@ -152,6 +152,103 @@ pub fn linear_f32_da3_base(
     false
 }
 
+/// Computes DA3-BASE's fused QKV projection directly into the head-major
+/// buffers consumed by attention, avoiding the token-major 3×768 staging
+/// tensor and its subsequent transpose.
+pub fn qkv_f32_da3_base(
+    a: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    q: &mut [f32],
+    k: &mut [f32],
+    v: &mut [f32],
+) -> bool {
+    let tokens = DA3_BASE_TOKENS_504X336;
+    if std::env::var_os("DA3_KERNELS_DISABLE_QKV_DIRECT").is_some()
+        || a.len() != tokens * 768
+        || weight.len() != 768 * 2304
+        || bias.len() != 2304
+        || q.len() != tokens * 768
+        || k.len() != q.len()
+        || v.len() != q.len()
+    {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
+        unsafe { qkv_avx512(a, weight, bias, q, k, v) };
+        return true;
+    }
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn qkv_avx512(
+    a: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    q: &mut [f32],
+    k: &mut [f32],
+    v: &mut [f32],
+) {
+    use core::arch::x86_64::*;
+    use rayon::prelude::*;
+    const ROWS: usize = 6;
+    const N: usize = 2304;
+    const K: usize = 768;
+    let q_ptr = q.as_mut_ptr() as usize;
+    let k_ptr = k.as_mut_ptr() as usize;
+    let v_ptr = v.as_mut_ptr() as usize;
+    // One 64-column tile is exactly one attention head within Q, K, or V.
+    // Rows are independent; the accumulator order stays K-major FMA.
+    (0..DA3_BASE_TOKENS_504X336)
+        .step_by(ROWS)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .for_each(|row0| {
+            let rows = (DA3_BASE_TOKENS_504X336 - row0).min(ROWS);
+            for col0 in (0..N).step_by(64) {
+                let mut acc = [[_mm512_setzero_ps(); 4]; ROWS];
+                for input in 0..K {
+                    let bp = unsafe { weight.as_ptr().add(input * N + col0) };
+                    let bv = unsafe {
+                        [
+                            _mm512_loadu_ps(bp),
+                            _mm512_loadu_ps(bp.add(16)),
+                            _mm512_loadu_ps(bp.add(32)),
+                            _mm512_loadu_ps(bp.add(48)),
+                        ]
+                    };
+                    for row in 0..rows {
+                        let av = _mm512_set1_ps(a[(row0 + row) * K + input]);
+                        for block in 0..4 {
+                            acc[row][block] = _mm512_fmadd_ps(av, bv[block], acc[row][block]);
+                        }
+                    }
+                }
+                let group = col0 / 768;
+                let head = (col0 % 768) / 64;
+                for row in 0..rows {
+                    let destination = match group {
+                        0 => q_ptr,
+                        1 => k_ptr,
+                        _ => v_ptr,
+                    } as *mut f32;
+                    let p = unsafe {
+                        destination.add((head * DA3_BASE_TOKENS_504X336 + row0 + row) * 64)
+                    };
+                    for block in 0..4 {
+                        let b = unsafe { _mm512_loadu_ps(bias.as_ptr().add(col0 + block * 16)) };
+                        unsafe {
+                            _mm512_storeu_ps(p.add(block * 16), _mm512_add_ps(acc[row][block], b));
+                        }
+                    }
+                }
+            }
+        });
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,fma")]
 unsafe fn linear_avx512(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
