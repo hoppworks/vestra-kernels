@@ -97,25 +97,20 @@ unsafe fn linear_avx512(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &
                         };
                     }
                 }
-                debug_assert_eq!(k % 4, 0);
-                for kk0 in (0..k).step_by(4) {
-                    // A fixed inner bound gives the target compiler an
-                    // explicit unroll point without changing F32 order.
-                    for kk in kk0..kk0 + 4 {
-                        let bp = unsafe { b.as_ptr().add(kk * n + col0) };
-                        let bv = unsafe {
-                            [
-                                _mm512_loadu_ps(bp),
-                                _mm512_loadu_ps(bp.add(16)),
-                                _mm512_loadu_ps(bp.add(32)),
-                                _mm512_loadu_ps(bp.add(48)),
-                            ]
-                        };
-                        for row in 0..rows {
-                            let av = _mm512_set1_ps(a[(row0 + row) * k + kk]);
-                            for block in 0..4 {
-                                acc[row][block] = _mm512_fmadd_ps(av, bv[block], acc[row][block]);
-                            }
+                for kk in 0..k {
+                    let bp = unsafe { b.as_ptr().add(kk * n + col0) };
+                    let bv = unsafe {
+                        [
+                            _mm512_loadu_ps(bp),
+                            _mm512_loadu_ps(bp.add(16)),
+                            _mm512_loadu_ps(bp.add(32)),
+                            _mm512_loadu_ps(bp.add(48)),
+                        ]
+                    };
+                    for row in 0..rows {
+                        let av = _mm512_set1_ps(a[(row0 + row) * k + kk]);
+                        for block in 0..4 {
+                            acc[row][block] = _mm512_fmadd_ps(av, bv[block], acc[row][block]);
                         }
                     }
                 }
