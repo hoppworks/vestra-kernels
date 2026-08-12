@@ -8,6 +8,111 @@
 /// pretend to support arbitrary matrix shapes.
 pub const DA3_BASE_TOKENS_504X336: usize = 865;
 
+/// Fuses DA3-BASE Q/K LayerNorm and 2D RoPE. The caller uses this only for
+/// the late blocks where both operations are enabled. Each row keeps the
+/// scalar LayerNorm reduction order; fusion merely avoids materializing the
+/// normalized Q and K tensors before immediately rotating them.
+#[allow(clippy::too_many_arguments)]
+pub fn qk_norm_rope_f32_da3_base(
+    q: &mut [f32],
+    k: &mut [f32],
+    q_gamma: &[f32],
+    q_beta: &[f32],
+    k_gamma: &[f32],
+    k_beta: &[f32],
+    positions_yx: &[i64],
+    frequency: f32,
+    epsilon: f32,
+) -> bool {
+    const HEADS: usize = 12;
+    const DIM: usize = 64;
+    if std::env::var_os("DA3_KERNELS_DISABLE_QK_NORM_ROPE").is_some()
+        || q.len() != HEADS * DA3_BASE_TOKENS_504X336 * DIM
+        || k.len() != q.len()
+        || q_gamma.len() != DIM
+        || q_beta.len() != DIM
+        || k_gamma.len() != DIM
+        || k_beta.len() != DIM
+        || positions_yx.len() != DA3_BASE_TOKENS_504X336 * 2
+    {
+        return false;
+    }
+
+    let rotations = rope_rotations(positions_yx, frequency);
+    rayon::join(
+        || normalize_and_rotate(q, q_gamma, q_beta, epsilon, &rotations),
+        || normalize_and_rotate(k, k_gamma, k_beta, epsilon, &rotations),
+    );
+    true
+}
+
+fn rope_rotations(positions_yx: &[i64], frequency: f32) -> Vec<f32> {
+    const QUARTER: usize = 16;
+    const HALF_DIM: usize = 32;
+    let inv_freq: Vec<f32> = (0..QUARTER)
+        .map(|i| frequency.powf(-2.0 * i as f32 / HALF_DIM as f32))
+        .collect();
+    let mut rotations = vec![0.0; DA3_BASE_TOKENS_504X336 * 2 * QUARTER * 2];
+    for token in 0..DA3_BASE_TOKENS_504X336 {
+        for (axis, position) in [positions_yx[2 * token], positions_yx[2 * token + 1]]
+            .into_iter()
+            .enumerate()
+        {
+            for (i, freq) in inv_freq.iter().enumerate() {
+                let (sin, cos) = (position as f32 * freq).sin_cos();
+                let offset = (token * 2 * QUARTER + axis * QUARTER + i) * 2;
+                rotations[offset] = sin;
+                rotations[offset + 1] = cos;
+            }
+        }
+    }
+    rotations
+}
+
+fn normalize_and_rotate(
+    values: &mut [f32],
+    gamma: &[f32],
+    beta: &[f32],
+    epsilon: f32,
+    rotations: &[f32],
+) {
+    use rayon::prelude::*;
+    const DIM: usize = 64;
+    const QUARTER: usize = 16;
+    values
+        .par_chunks_mut(DIM)
+        .enumerate()
+        .for_each(|(row, data)| {
+            let mean = data.iter().sum::<f32>() / DIM as f32;
+            let variance = data
+                .iter()
+                .map(|value| {
+                    let delta = value - mean;
+                    delta * delta
+                })
+                .sum::<f32>()
+                / DIM as f32;
+            let inverse = 1.0 / (variance + epsilon).sqrt();
+            for dim in 0..DIM {
+                data[dim] = (data[dim] - mean) * inverse * gamma[dim] + beta[dim];
+            }
+            let token = row % DA3_BASE_TOKENS_504X336;
+            for axis in 0..2 {
+                let base = axis * 32;
+                let rotation = &rotations[(token * 2 * QUARTER + axis * QUARTER) * 2
+                    ..(token * 2 * QUARTER + axis * QUARTER + QUARTER) * 2];
+                for i in 0..QUARTER {
+                    let sin = rotation[i * 2];
+                    let cos = rotation[i * 2 + 1];
+                    let first = data[base + i];
+                    let second = data[base + i + QUARTER];
+                    data[base + i] = first * cos - second * sin;
+                    data[base + i + QUARTER] = second * cos + first * sin;
+                }
+            }
+        });
+}
+
 /// Multiplies one F(2x2,3x3) Winograd tile block in the filter layout used by
 /// ggml: `u[position][input_channel][output_channel]` and
 /// `v[position][input_channel][tile]`.  It is deliberately a small, explicit
