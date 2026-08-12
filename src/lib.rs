@@ -660,4 +660,15 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
     }
+
+    #[test]
+    fn projection_kernel_overwrites_its_output_buffer() {
+        let (m, n, k) = (DA3_BASE_TOKENS_504X336, 768, 768);
+        let a = vec![0.0; m * k];
+        let b = vec![0.0; k * n];
+        let mut output = vec![f32::NAN; m * n];
+        if linear_f32_da3_base(m, n, k, &a, &b, &mut output) {
+            assert!(output.iter().all(|value| *value == 0.0));
+        }
+    }
 }
