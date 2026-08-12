@@ -599,35 +599,31 @@ unsafe fn flash_attention_avx512(
 
                     for k0 in (0..tokens).step_by(KVT) {
                         let cols = (tokens - k0).min(KVT);
-                        let mut packed_v = [0.0f32; KVT * D];
-                        let mut packed_k = [0.0f32; KVT * D];
+                        let mut scores = [0.0f32; QT * KVT];
+                        // The production path uses the persistent head pack.
+                        // Keep the 16 KiB fallback stack buffer out of every
+                        // normal 64-key iteration.
                         if packed_k_head.is_empty() {
+                            let mut packed_k = [0.0f32; KVT * D];
                             for key in 0..cols {
                                 let source = &k_head[(k0 + key) * D..(k0 + key + 1) * D];
                                 for dim in 0..D {
                                     packed_k[dim * KVT + key] = source[dim];
                                 }
                             }
-                        }
-                        if cols < KVT {
-                            for key in 0..cols {
-                                packed_v[key * D..(key + 1) * D]
-                                    .copy_from_slice(&v_head[(k0 + key) * D..(k0 + key + 1) * D]);
-                            }
-                        }
-
-                        let mut scores = [0.0f32; QT * KVT];
-                        // SAFETY: fixed 64-wide packed matrices, and `rows`
-                        // never exceeds the 64-row query tile.
-                        unsafe {
-                            if packed_k_head.is_empty() {
+                            // SAFETY: fixed 64-wide packed matrices, and
+                            // `rows` never exceeds the query tile.
+                            unsafe {
                                 gemm_4x64_overwrite(
                                     rows,
                                     &q_head[q0 * D..(q0 + rows) * D],
                                     &packed_k,
                                     &mut scores,
-                                )
-                            } else {
+                                );
+                            }
+                        } else {
+                            // SAFETY: the persistent pack has 64-wide columns.
+                            unsafe {
                                 gemm_4x64_overwrite_stride(
                                     rows,
                                     &q_head[q0 * D..(q0 + rows) * D],
@@ -635,9 +631,9 @@ unsafe fn flash_attention_avx512(
                                     PACKED_TOKENS,
                                     k0,
                                     &mut scores,
-                                )
+                                );
                             }
-                        };
+                        }
 
                         for row in 0..rows {
                             let mut tile_max = f32::NEG_INFINITY;
@@ -681,6 +677,12 @@ unsafe fn flash_attention_avx512(
                                     &mut accum,
                                 )
                             } else {
+                                let mut packed_v = [0.0f32; KVT * D];
+                                for key in 0..cols {
+                                    packed_v[key * D..(key + 1) * D].copy_from_slice(
+                                        &v_head[(k0 + key) * D..(k0 + key + 1) * D],
+                                    );
+                                }
                                 gemm_4x64_accumulate(rows, &scores, &packed_v, &mut accum)
                             }
                         };
