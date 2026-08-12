@@ -1,0 +1,14 @@
+[package]
+name = "da3-kernels"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Narrow, independently benchmarked CPU kernels for Depth Anything 3"
+repository = "https://github.com/hoppworks/da3-kernels"
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
