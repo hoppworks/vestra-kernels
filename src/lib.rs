@@ -57,7 +57,6 @@ unsafe fn flash_attention_avx512(
     tokens: usize,
     out: &mut [f32],
 ) {
-    use core::arch::x86_64::*;
     use rayon::prelude::*;
 
     const D: usize = 64;
@@ -131,7 +130,8 @@ unsafe fn flash_attention_avx512(
                             for value in &mut scores[row * KVT..row * KVT + cols] {
                                 *value -= new_max;
                             }
-                            let score_row: &mut [f32; KVT] = scores[row * KVT..(row + 1) * KVT]
+                            let score_row: &mut [f32; KVT] = (&mut scores
+                                [row * KVT..(row + 1) * KVT])
                                 .try_into()
                                 .expect("fixed score tile");
                             // SAFETY: every score row is the fixed 64-key tile.
