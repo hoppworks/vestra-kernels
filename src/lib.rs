@@ -81,7 +81,7 @@ pub fn linear_f32_da3_base(
 unsafe fn linear_avx512(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
     use core::arch::x86_64::*;
     use rayon::prelude::*;
-    const ROWS: usize = 7;
+    const ROWS: usize = 6;
     c.par_chunks_mut(ROWS * n)
         .enumerate()
         .for_each(|(tile, c_tile)| {
