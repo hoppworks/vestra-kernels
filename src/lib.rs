@@ -47,6 +47,86 @@ pub fn flash_attention_f32_da3_base(
     false
 }
 
+/// Computes one of DA3-BASE's fixed transformer projections in row-major
+/// form. Returns false for every other shape so callers retain their normal
+/// GEMM backend without a behavioural fork.
+pub fn linear_f32_da3_base(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+) -> bool {
+    if std::env::var_os("DA3_KERNELS_DISABLE_LINEAR").is_some()
+        || m != DA3_BASE_TOKENS_504X336
+        || !matches!((k, n), (768, 2304) | (768, 768) | (768, 3072) | (3072, 768))
+        || a.len() != m * k
+        || b.len() != k * n
+        || c.len() != m * n
+    {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
+        // SAFETY: ISA and exact contiguous matrix dimensions were validated.
+        unsafe { linear_avx512(m, n, k, a, b, c) };
+        return true;
+    }
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn linear_avx512(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+    use core::arch::x86_64::*;
+    use rayon::prelude::*;
+    c.par_chunks_mut(4 * n)
+        .enumerate()
+        .for_each(|(tile, c_tile)| {
+            let row0 = tile * 4;
+            let rows = (m - row0).min(4);
+            for col0 in (0..n).step_by(64) {
+                let mut acc = [[_mm512_setzero_ps(); 4]; 4];
+                for row in 0..rows {
+                    for block in 0..4 {
+                        // SAFETY: all selected rows and 64-column tiles are in bounds.
+                        acc[row][block] = unsafe {
+                            _mm512_loadu_ps(c_tile.as_ptr().add(row * n + col0 + block * 16))
+                        };
+                    }
+                }
+                for kk in 0..k {
+                    let bp = unsafe { b.as_ptr().add(kk * n + col0) };
+                    let bv = unsafe {
+                        [
+                            _mm512_loadu_ps(bp),
+                            _mm512_loadu_ps(bp.add(16)),
+                            _mm512_loadu_ps(bp.add(32)),
+                            _mm512_loadu_ps(bp.add(48)),
+                        ]
+                    };
+                    for row in 0..rows {
+                        let av = _mm512_set1_ps(a[(row0 + row) * k + kk]);
+                        for block in 0..4 {
+                            acc[row][block] = _mm512_fmadd_ps(av, bv[block], acc[row][block]);
+                        }
+                    }
+                }
+                for row in 0..rows {
+                    for block in 0..4 {
+                        unsafe {
+                            _mm512_storeu_ps(
+                                c_tile.as_mut_ptr().add(row * n + col0 + block * 16),
+                                acc[row][block],
+                            )
+                        };
+                    }
+                }
+            }
+        });
+}
+
 /// The same 4-query × 64-key streaming tile used by ggml's CPU flash path.
 /// K is packed once per tile into a dimension-major layout; a ZMM then scores
 /// sixteen keys at once. The online softmax keeps the memory footprint O(ND).
