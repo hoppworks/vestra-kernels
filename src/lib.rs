@@ -251,7 +251,13 @@ pub fn linear_f32_da3_base(
     #[cfg(target_arch = "x86_64")]
     if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
         // SAFETY: ISA and exact contiguous matrix dimensions were validated.
-        unsafe { linear_avx512(m, n, k, a, b, c) };
+        unsafe {
+            if std::env::var_os("DA3_KERNELS_DISABLE_LINEAR_COLUMN_SPLIT").is_some() {
+                linear_avx512(m, n, k, a, b, c);
+            } else {
+                linear_avx512_column_split(m, n, k, a, b, c);
+            }
+        };
         return true;
     }
     false
@@ -638,6 +644,64 @@ unsafe fn linear_avx512(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &
                                 acc[row][block],
                             )
                         };
+                    }
+                }
+            }
+        });
+}
+
+/// Column-panel work partition for the same fixed-shape projection GEMMs.
+/// It keeps a 64-column weight panel private to one worker, trading repeated
+/// small activation scans for substantially less shared-L3 weight traffic.
+/// Every output still accumulates K in ascending order with the same FMAs.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn linear_avx512_column_split(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+) {
+    use core::arch::x86_64::*;
+    use rayon::prelude::*;
+    const ROWS: usize = 6;
+    let c_ptr = c.as_mut_ptr() as usize;
+    (0..n)
+        .step_by(64)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .for_each(|col0| {
+            for row0 in (0..m).step_by(ROWS) {
+                let rows = (m - row0).min(ROWS);
+                let mut acc = [[_mm512_setzero_ps(); 4]; ROWS];
+                for kk in 0..k {
+                    let bp = unsafe { b.as_ptr().add(kk * n + col0) };
+                    let bv = unsafe {
+                        [
+                            _mm512_loadu_ps(bp),
+                            _mm512_loadu_ps(bp.add(16)),
+                            _mm512_loadu_ps(bp.add(32)),
+                            _mm512_loadu_ps(bp.add(48)),
+                        ]
+                    };
+                    for row in 0..rows {
+                        let av = _mm512_set1_ps(a[(row0 + row) * k + kk]);
+                        for block in 0..4 {
+                            acc[row][block] = _mm512_fmadd_ps(av, bv[block], acc[row][block]);
+                        }
+                    }
+                }
+                for row in 0..rows {
+                    for block in 0..4 {
+                        unsafe {
+                            _mm512_storeu_ps(
+                                (c_ptr as *mut f32)
+                                    .add((row0 + row) * n + col0 + block * 16),
+                                acc[row][block],
+                            );
+                        }
                     }
                 }
             }
@@ -1063,6 +1127,27 @@ mod tests {
         if linear_f32_da3_base(m, n, k, &a, &b, &mut output) {
             assert!(output.iter().all(|value| *value == 0.0));
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn column_split_projection_matches_row_split_bitwise() {
+        if !(std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma")) {
+            return;
+        }
+        let (m, n, k) = (DA3_BASE_TOKENS_504X336, 768, 768);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.013).sin()).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.007).cos()).collect();
+        let mut rows = vec![0.0f32; m * n];
+        let mut columns = vec![0.0f32; m * n];
+        unsafe {
+            linear_avx512(m, n, k, &a, &b, &mut rows);
+            linear_avx512_column_split(m, n, k, &a, &b, &mut columns);
+        }
+        assert_eq!(
+            rows.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            columns.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        );
     }
 
     #[test]
