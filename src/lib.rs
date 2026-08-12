@@ -183,6 +183,167 @@ pub fn linear_bias_scale_f32_da3_base(
     false
 }
 
+/// DA3-BASE's FC1 projection with its bias and exact-erf GELU epilogue
+/// folded into the final store. This avoids two full activation-memory passes
+/// over the 865×3072 intermediate without changing the K-major FMA order.
+pub fn linear_bias_gelu_f32_da3_base(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    c: &mut [f32],
+) -> bool {
+    if std::env::var_os("DA3_KERNELS_DISABLE_FC1_EPILOGUE").is_some()
+        || m != DA3_BASE_TOKENS_504X336
+        || (k, n) != (768, 3072)
+        || a.len() != m * k
+        || b.len() != k * n
+        || bias.len() != n
+        || c.len() != m * n
+    {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
+        unsafe { linear_bias_gelu_avx512(m, n, k, a, b, bias, c) };
+        return true;
+    }
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn linear_bias_gelu_avx512(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    c: &mut [f32],
+) {
+    use core::arch::x86_64::*;
+    use rayon::prelude::*;
+    const ROWS: usize = 6;
+    c.par_chunks_mut(ROWS * n)
+        .enumerate()
+        .for_each(|(tile, c_tile)| {
+            let row0 = tile * ROWS;
+            let rows = (m - row0).min(ROWS);
+            for col0 in (0..n).step_by(64) {
+                let mut acc = [[_mm512_setzero_ps(); 4]; ROWS];
+                for kk in 0..k {
+                    let bp = unsafe { b.as_ptr().add(kk * n + col0) };
+                    let bv = unsafe {
+                        [
+                            _mm512_loadu_ps(bp),
+                            _mm512_loadu_ps(bp.add(16)),
+                            _mm512_loadu_ps(bp.add(32)),
+                            _mm512_loadu_ps(bp.add(48)),
+                        ]
+                    };
+                    for row in 0..rows {
+                        let av = _mm512_set1_ps(a[(row0 + row) * k + kk]);
+                        for block in 0..4 {
+                            acc[row][block] = _mm512_fmadd_ps(av, bv[block], acc[row][block]);
+                        }
+                    }
+                }
+                for row in 0..rows {
+                    for block in 0..4 {
+                        let offset = col0 + block * 16;
+                        let bias_v = unsafe { _mm512_loadu_ps(bias.as_ptr().add(offset)) };
+                        let out = unsafe { gelu_avx512(_mm512_add_ps(acc[row][block], bias_v)) };
+                        unsafe { _mm512_storeu_ps(c_tile.as_mut_ptr().add(row * n + offset), out) };
+                    }
+                }
+            }
+        });
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn gelu_avx512(x: core::arch::x86_64::__m512) -> core::arch::x86_64::__m512 {
+    use core::arch::x86_64::*;
+    let one = _mm512_set1_ps(1.0);
+    let half = _mm512_set1_ps(0.5);
+    let inv_sqrt2 = _mm512_set1_ps(0.707_106_78);
+    let x = x;
+    let abs_mask = _mm512_set1_epi32(0x7fff_ffff);
+    let x_abs = _mm512_castsi512_ps(_mm512_and_epi32(
+        _mm512_castps_si512(_mm512_mul_ps(x, inv_sqrt2)),
+        abs_mask,
+    ));
+    let arg = _mm512_mul_ps(x, inv_sqrt2);
+    let neg_mask = _mm512_cmp_ps_mask(arg, _mm512_setzero_ps(), _CMP_LT_OQ);
+    let sign = _mm512_mask_blend_ps(neg_mask, one, _mm512_set1_ps(-1.0));
+    let t = _mm512_div_ps(
+        one,
+        _mm512_fmadd_ps(_mm512_set1_ps(0.327_591_1), x_abs, one),
+    );
+    let mut poly = _mm512_set1_ps(1.061_405_4);
+    poly = _mm512_fmadd_ps(poly, t, _mm512_set1_ps(-1.453_152_0));
+    poly = _mm512_fmadd_ps(poly, t, _mm512_set1_ps(1.421_413_7));
+    poly = _mm512_fmadd_ps(poly, t, _mm512_set1_ps(-0.284_496_74));
+    poly = _mm512_fmadd_ps(poly, t, _mm512_set1_ps(0.254_829_59));
+    poly = _mm512_mul_ps(poly, t);
+    let erf = _mm512_mul_ps(
+        sign,
+        _mm512_fnmadd_ps(
+            poly,
+            unsafe {
+                exp_avx512(_mm512_sub_ps(
+                    _mm512_setzero_ps(),
+                    _mm512_mul_ps(x_abs, x_abs),
+                ))
+            },
+            one,
+        ),
+    );
+    _mm512_mul_ps(_mm512_mul_ps(half, x), _mm512_add_ps(one, erf))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn exp_avx512(x: core::arch::x86_64::__m512) -> core::arch::x86_64::__m512 {
+    use core::arch::x86_64::*;
+    let x = _mm512_max_ps(
+        _mm512_min_ps(x, _mm512_set1_ps(88.376_26)),
+        _mm512_set1_ps(-88.376_26),
+    );
+    let one = _mm512_set1_ps(1.0);
+    let fx0 = _mm512_fmadd_ps(x, _mm512_set1_ps(1.442_695_04), _mm512_set1_ps(0.5));
+    let fx_trunc = _mm512_cvtepi32_ps(_mm512_cvttps_epi32(fx0));
+    let fx = _mm512_mask_sub_ps(
+        fx_trunc,
+        _mm512_cmp_ps_mask(fx_trunc, fx0, _CMP_GT_OQ),
+        fx_trunc,
+        one,
+    );
+    let x = _mm512_fnmadd_ps(fx, _mm512_set1_ps(0.693_359_375), x);
+    let x = _mm512_fnmadd_ps(fx, _mm512_set1_ps(-2.121_944_4e-4), x);
+    let z = _mm512_mul_ps(x, x);
+    let mut y = _mm512_set1_ps(1.987_569_15e-4);
+    for coefficient in [
+        1.398_199_95e-3,
+        8.333_451_9e-3,
+        4.166_579_6e-2,
+        1.666_666_5e-1,
+        5.000_000_1e-1,
+    ] {
+        y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(coefficient));
+    }
+    y = _mm512_fmadd_ps(y, z, x);
+    let y = _mm512_add_ps(y, one);
+    let exponent = _mm512_slli_epi32(
+        _mm512_add_epi32(_mm512_cvttps_epi32(fx), _mm512_set1_epi32(0x7f)),
+        23,
+    );
+    _mm512_mul_ps(y, _mm512_castsi512_ps(exponent))
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,fma")]
 unsafe fn linear_bias_scale_avx512(
