@@ -18,7 +18,8 @@ DA3-BASE transformer projection shapes at 504×336. No kernel is enabled yet.
 | 4×96 output-channel projection microkernel | 337.251 ms vs Faer 326.949 ms | Rejected; it reread weight tiles per token group. |
 | 4-query × 64-key F32 flash-attention prototype | 378.414 ms end-to-end smoke | Rejected from the main runtime; it still spends too much time in scalar exponentiation and temporary accumulation. |
 | 64-query × 64-key packed revision | 376.761 ms end-to-end smoke | Rejected; higher tile reuse did not beat the established per-query path. |
+| GGML-style 4×64 small GEMMs + packed Flash tiles | 299.535 ms vs 325.157 ms fallback (same binary, 1 warm-up + median of 5) | Accepted into `depth-anything-rs` after four-image F32 parity. |
 
-The flash candidate remains here for measurement work only. It is not a
-dependency of the production runtime. A replacement must first beat the
-existing attention implementation in an isolated A/B before it is imported.
+The accepted Flash kernel is an explicit local dependency of the production
+runtime. Future variants remain measurement-only until they beat it in an
+isolated A/B and pass the full F32 parity gate.
