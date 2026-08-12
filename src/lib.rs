@@ -347,14 +347,6 @@ unsafe fn linear_avx512(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &
             let rows = (m - row0).min(ROWS);
             for col0 in (0..n).step_by(64) {
                 let mut acc = [[_mm512_setzero_ps(); 4]; ROWS];
-                for row in 0..rows {
-                    for block in 0..4 {
-                        // SAFETY: all selected rows and 64-column tiles are in bounds.
-                        acc[row][block] = unsafe {
-                            _mm512_loadu_ps(c_tile.as_ptr().add(row * n + col0 + block * 16))
-                        };
-                    }
-                }
                 for kk in 0..k {
                     let bp = unsafe { b.as_ptr().add(kk * n + col0) };
                     let bv = unsafe {
