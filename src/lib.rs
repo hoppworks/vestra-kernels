@@ -394,7 +394,7 @@ unsafe fn flash_attention_avx512(
     use rayon::prelude::*;
 
     const D: usize = 64;
-    const QT: usize = 32;
+    const QT: usize = 20;
     const KVT: usize = 64;
     const PACKED_TOKENS: usize = 896;
     let scale = 1.0f32 / 8.0;
