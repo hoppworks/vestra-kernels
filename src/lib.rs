@@ -61,7 +61,7 @@ unsafe fn flash_attention_avx512(
     use rayon::prelude::*;
 
     const D: usize = 64;
-    const QT: usize = 4;
+    const QT: usize = 64;
     const KVT: usize = 64;
     let scale = 1.0f32 / 8.0;
 
@@ -74,100 +74,108 @@ unsafe fn flash_attention_avx512(
             let k_head = &k[base..base + tokens * D];
             let v_head = &v[base..base + tokens * D];
 
-            for q0 in (0..tokens).step_by(QT) {
-                let rows = (tokens - q0).min(QT);
-                let mut accum = [[0.0f32; D]; QT];
-                let mut sums = [0.0f32; QT];
-                let mut maxima = [f32::NEG_INFINITY; QT];
+            // One 64-query tile is large enough to amortise K packing. Nested
+            // Rayon exposes the 14 tiles per head rather than limiting this
+            // operation to twelve head-sized jobs on a 16-core benchmark.
+            out_head
+                .par_chunks_mut(QT * D)
+                .enumerate()
+                .for_each(|(tile, out_tile)| {
+                    let q0 = tile * QT;
+                    let rows = out_tile.len() / D;
+                    let mut accum = [[0.0f32; D]; QT];
+                    let mut sums = [0.0f32; QT];
+                    let mut maxima = [f32::NEG_INFINITY; QT];
 
-                for k0 in (0..tokens).step_by(KVT) {
-                    let cols = (tokens - k0).min(KVT);
-                    let mut packed_k = [[0.0f32; KVT]; D];
-                    for key in 0..cols {
-                        let source = &k_head[(k0 + key) * D..(k0 + key + 1) * D];
-                        for dim in 0..D {
-                            packed_k[dim][key] = source[dim];
-                        }
-                    }
-
-                    let mut scores = [[f32::NEG_INFINITY; KVT]; QT];
-                    for row in 0..rows {
-                        let query = &q_head[(q0 + row) * D..(q0 + row + 1) * D];
-                        let mut score_vectors = [_mm512_setzero_ps(); 4];
-                        for dim in 0..D {
-                            let qv = _mm512_set1_ps(query[dim]);
-                            let kp = packed_k[dim].as_ptr();
-                            for block in 0..4 {
-                                // SAFETY: the fixed 64-key tile has four full
-                                // sixteen-float blocks; `kp` points into it.
-                                let kv = unsafe { _mm512_loadu_ps(kp.add(block * 16)) };
-                                score_vectors[block] =
-                                    _mm512_fmadd_ps(qv, kv, score_vectors[block]);
-                            }
-                        }
-                        for block in 0..4 {
-                            // SAFETY: score rows are fixed 64-float tiles.
-                            unsafe {
-                                _mm512_storeu_ps(
-                                    scores[row].as_mut_ptr().add(block * 16),
-                                    score_vectors[block],
-                                );
-                            }
-                        }
-                    }
-
-                    for row in 0..rows {
-                        let mut tile_max = f32::NEG_INFINITY;
-                        for value in &mut scores[row][..cols] {
-                            *value *= scale;
-                            tile_max = tile_max.max(*value);
-                        }
-                        let new_max = maxima[row].max(tile_max);
-                        let correction = if maxima[row].is_finite() {
-                            (maxima[row] - new_max).exp()
-                        } else {
-                            0.0
-                        };
-                        sums[row] *= correction;
-                        for dim in 0..D {
-                            accum[row][dim] *= correction;
-                        }
-                        for value in &mut scores[row][..cols] {
-                            *value = (*value - new_max).exp();
-                            sums[row] += *value;
-                        }
-                        maxima[row] = new_max;
-                    }
-
-                    for row in 0..rows {
-                        let mut result = [_mm512_setzero_ps(); 4];
+                    for k0 in (0..tokens).step_by(KVT) {
+                        let cols = (tokens - k0).min(KVT);
+                        let mut packed_k = [[0.0f32; KVT]; D];
                         for key in 0..cols {
-                            let probability = _mm512_set1_ps(scores[row][key]);
-                            let value = &v_head[(k0 + key) * D..(k0 + key + 1) * D];
-                            for block in 0..4 {
-                                // SAFETY: every value row has exactly 64 dims.
-                                let vv = unsafe { _mm512_loadu_ps(value.as_ptr().add(block * 16)) };
-                                result[block] = _mm512_fmadd_ps(probability, vv, result[block]);
+                            let source = &k_head[(k0 + key) * D..(k0 + key + 1) * D];
+                            for dim in 0..D {
+                                packed_k[dim][key] = source[dim];
                             }
                         }
-                        for block in 0..4 {
-                            let mut partial = [0.0f32; 16];
-                            // SAFETY: `partial` has one complete ZMM width.
-                            unsafe { _mm512_storeu_ps(partial.as_mut_ptr(), result[block]) };
-                            for lane in 0..16 {
-                                accum[row][block * 16 + lane] += partial[lane];
-                            }
-                        }
-                    }
-                }
 
-                for row in 0..rows {
-                    let inverse_sum = 1.0 / sums[row];
-                    for dim in 0..D {
-                        out_head[(q0 + row) * D + dim] = accum[row][dim] * inverse_sum;
+                        let mut scores = [[f32::NEG_INFINITY; KVT]; QT];
+                        for row in 0..rows {
+                            let query = &q_head[(q0 + row) * D..(q0 + row + 1) * D];
+                            let mut score_vectors = [_mm512_setzero_ps(); 4];
+                            for dim in 0..D {
+                                let qv = _mm512_set1_ps(query[dim]);
+                                let kp = packed_k[dim].as_ptr();
+                                for block in 0..4 {
+                                    // SAFETY: the fixed 64-key tile has four full
+                                    // sixteen-float blocks; `kp` points into it.
+                                    let kv = unsafe { _mm512_loadu_ps(kp.add(block * 16)) };
+                                    score_vectors[block] =
+                                        _mm512_fmadd_ps(qv, kv, score_vectors[block]);
+                                }
+                            }
+                            for block in 0..4 {
+                                // SAFETY: score rows are fixed 64-float tiles.
+                                unsafe {
+                                    _mm512_storeu_ps(
+                                        scores[row].as_mut_ptr().add(block * 16),
+                                        score_vectors[block],
+                                    );
+                                }
+                            }
+                        }
+
+                        for row in 0..rows {
+                            let mut tile_max = f32::NEG_INFINITY;
+                            for value in &mut scores[row][..cols] {
+                                *value *= scale;
+                                tile_max = tile_max.max(*value);
+                            }
+                            let new_max = maxima[row].max(tile_max);
+                            let correction = if maxima[row].is_finite() {
+                                (maxima[row] - new_max).exp()
+                            } else {
+                                0.0
+                            };
+                            sums[row] *= correction;
+                            for dim in 0..D {
+                                accum[row][dim] *= correction;
+                            }
+                            for value in &mut scores[row][..cols] {
+                                *value = (*value - new_max).exp();
+                                sums[row] += *value;
+                            }
+                            maxima[row] = new_max;
+                        }
+
+                        for row in 0..rows {
+                            let mut result = [_mm512_setzero_ps(); 4];
+                            for key in 0..cols {
+                                let probability = _mm512_set1_ps(scores[row][key]);
+                                let value = &v_head[(k0 + key) * D..(k0 + key + 1) * D];
+                                for block in 0..4 {
+                                    // SAFETY: every value row has exactly 64 dims.
+                                    let vv =
+                                        unsafe { _mm512_loadu_ps(value.as_ptr().add(block * 16)) };
+                                    result[block] = _mm512_fmadd_ps(probability, vv, result[block]);
+                                }
+                            }
+                            for block in 0..4 {
+                                let mut partial = [0.0f32; 16];
+                                // SAFETY: `partial` has one complete ZMM width.
+                                unsafe { _mm512_storeu_ps(partial.as_mut_ptr(), result[block]) };
+                                for lane in 0..16 {
+                                    accum[row][block * 16 + lane] += partial[lane];
+                                }
+                            }
+                        }
                     }
-                }
-            }
+
+                    for row in 0..rows {
+                        let inverse_sum = 1.0 / sums[row];
+                        for dim in 0..D {
+                            out_tile[row * D + dim] = accum[row][dim] * inverse_sum;
+                        }
+                    }
+                });
         });
 }
 
