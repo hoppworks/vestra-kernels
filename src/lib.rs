@@ -8,6 +8,82 @@
 /// pretend to support arbitrary matrix shapes.
 pub const DA3_BASE_TOKENS_504X336: usize = 865;
 
+/// Multiplies one F(2x2,3x3) Winograd tile block in the filter layout used by
+/// ggml: `u[position][input_channel][output_channel]` and
+/// `v[position][input_channel][tile]`.  It is deliberately a small, explicit
+/// building block; layout creation and the exact Winograd transforms remain
+/// owned by the runtime.
+pub fn winograd_f2_blocked_f32(
+    u: &[f32],
+    v: &[f32],
+    m: &mut [f32],
+    input_channels: usize,
+    output_channels: usize,
+    tiles: usize,
+) -> bool {
+    if std::env::var_os("DA3_KERNELS_DISABLE_WINO").is_some()
+        || tiles == 0
+        || tiles > 8
+        || output_channels % 16 != 0
+        || u.len() != 16 * input_channels * output_channels
+        || v.len() != 16 * input_channels * tiles
+        || m.len() != 16 * tiles * output_channels
+    {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
+        // SAFETY: the exact contiguous layouts and AVX-512 availability were
+        // checked above. Each output vector is independent.
+        unsafe {
+            winograd_f2_blocked_avx512(u, v, m, input_channels, output_channels, tiles);
+        }
+        return true;
+    }
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn winograd_f2_blocked_avx512(
+    u: &[f32],
+    v: &[f32],
+    m: &mut [f32],
+    input_channels: usize,
+    output_channels: usize,
+    tiles: usize,
+) {
+    use core::arch::x86_64::*;
+    for position in 0..16 {
+        let u_position = &u[position * input_channels * output_channels..];
+        let v_position = &v[position * input_channels * tiles..];
+        let m_position = &mut m[position * tiles * output_channels..];
+        for output0 in (0..output_channels).step_by(16) {
+            let mut accumulators = [_mm512_setzero_ps(); 8];
+            for input in 0..input_channels {
+                let filter = unsafe {
+                    _mm512_loadu_ps(u_position.as_ptr().add(input * output_channels + output0))
+                };
+                let values = &v_position[input * tiles..input * tiles + tiles];
+                for tile in 0..tiles {
+                    accumulators[tile] =
+                        _mm512_fmadd_ps(filter, _mm512_set1_ps(values[tile]), accumulators[tile]);
+                }
+            }
+            for tile in 0..tiles {
+                unsafe {
+                    _mm512_storeu_ps(
+                        m_position
+                            .as_mut_ptr()
+                            .add(tile * output_channels + output0),
+                        accumulators[tile],
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Transformer projection shapes eligible for a future specialised kernel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Da3BaseProjection {
@@ -371,6 +447,43 @@ mod tests {
                 output_channels: 2304,
             }
             .is_supported()
+        );
+    }
+
+    #[test]
+    fn blocked_winograd_matches_scalar_f32_accumulation() {
+        let (inputs, outputs, tiles) = (3, 16, 3);
+        let u: Vec<f32> = (0..16 * inputs * outputs)
+            .map(|i| (i as f32 * 0.013).sin())
+            .collect();
+        let v: Vec<f32> = (0..16 * inputs * tiles)
+            .map(|i| (i as f32 * 0.017).cos())
+            .collect();
+        let mut actual = vec![0.0; 16 * tiles * outputs];
+        if !winograd_f2_blocked_f32(&u, &v, &mut actual, inputs, outputs, tiles) {
+            return;
+        }
+        let mut expected = vec![0.0; actual.len()];
+        for position in 0..16 {
+            for tile in 0..tiles {
+                for output in 0..outputs {
+                    for input in 0..inputs {
+                        let slot = &mut expected[(position * tiles + tile) * outputs + output];
+                        *slot = u[(position * inputs + input) * outputs + output]
+                            .mul_add(v[(position * inputs + input) * tiles + tile], *slot);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
         );
     }
 }
