@@ -7,6 +7,7 @@ description = "Narrow, independently benchmarked CPU kernels for Depth Anything 
 repository = "https://github.com/hoppworks/da3-kernels"
 
 [dependencies]
+rayon = "1.10"
 
 [dev-dependencies]
 
