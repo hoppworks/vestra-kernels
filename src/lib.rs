@@ -140,7 +140,11 @@ unsafe fn flash_attention_avx512(
                                 accum[row][dim] *= correction;
                             }
                             for value in &mut scores[row][..cols] {
-                                *value = (*value - new_max).exp();
+                                *value -= new_max;
+                            }
+                            // SAFETY: every score row is the fixed 64-key tile.
+                            unsafe { exp_64_avx512(&mut scores[row]) };
+                            for value in &scores[row][..cols] {
                                 sums[row] += *value;
                             }
                             maxima[row] = new_max;
@@ -177,6 +181,56 @@ unsafe fn flash_attention_avx512(
                     }
                 });
         });
+}
+
+/// Cephes-style vector exponential. Keeping the score tile at 64 values lets
+/// the hot softmax portion run as exactly four ZMM operations.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn exp_64_avx512(values: &mut [f32; 64]) {
+    use core::arch::x86_64::*;
+    let hi = _mm512_set1_ps(88.376_26);
+    let lo = _mm512_set1_ps(-88.376_26);
+    let log2ef = _mm512_set1_ps(1.442_695_04);
+    let half = _mm512_set1_ps(0.5);
+    let one = _mm512_set1_ps(1.0);
+    let ln2_hi = _mm512_set1_ps(0.693_359_375);
+    let ln2_lo = _mm512_set1_ps(-2.121_944_4e-4);
+    let p = [
+        _mm512_set1_ps(1.987_569_15e-4),
+        _mm512_set1_ps(1.398_199_95e-3),
+        _mm512_set1_ps(8.333_451_9e-3),
+        _mm512_set1_ps(4.166_579_6e-2),
+        _mm512_set1_ps(1.666_666_5e-1),
+        _mm512_set1_ps(5.000_000_1e-1),
+    ];
+    for block in 0..4 {
+        // SAFETY: `values` has four contiguous sixteen-float blocks.
+        let ptr = unsafe { values.as_mut_ptr().add(block * 16) };
+        let x = unsafe { _mm512_max_ps(_mm512_min_ps(_mm512_loadu_ps(ptr), hi), lo) };
+        let fx0 = _mm512_fmadd_ps(x, log2ef, half);
+        let trunc = _mm512_cvtepi32_ps(_mm512_cvttps_epi32(fx0));
+        let gt = _mm512_cmp_ps_mask(trunc, fx0, _CMP_GT_OQ);
+        let fx = _mm512_mask_sub_ps(trunc, gt, trunc, one);
+        let x = _mm512_fnmadd_ps(fx, ln2_lo, _mm512_fnmadd_ps(fx, ln2_hi, x));
+        let z = _mm512_mul_ps(x, x);
+        let mut y = p[0];
+        for coefficient in &p[1..] {
+            y = _mm512_fmadd_ps(y, x, *coefficient);
+        }
+        y = _mm512_fmadd_ps(y, z, x);
+        let exponent = _mm512_slli_epi32(
+            _mm512_add_epi32(_mm512_cvttps_epi32(fx), _mm512_set1_epi32(0x7f)),
+            23,
+        );
+        // SAFETY: `ptr` addresses the same valid sixteen-float block.
+        unsafe {
+            _mm512_storeu_ps(
+                ptr,
+                _mm512_mul_ps(_mm512_add_ps(y, one), _mm512_castsi512_ps(exponent)),
+            )
+        };
+    }
 }
 
 impl Da3BaseProjection {
