@@ -19,6 +19,7 @@ DA3-BASE transformer projection shapes at 504×336. No kernel is enabled yet.
 | 4-query × 64-key F32 flash-attention prototype | 378.414 ms end-to-end smoke | Rejected from the main runtime; it still spends too much time in scalar exponentiation and temporary accumulation. |
 | 64-query × 64-key packed revision | 376.761 ms end-to-end smoke | Rejected; higher tile reuse did not beat the established per-query path. |
 | GGML-style 4×64 small GEMMs + packed Flash tiles | 299.535 ms vs 325.157 ms fallback (same binary, 1 warm-up + median of 5) | Accepted into `depth-anything-rs` after four-image F32 parity. |
+| 4×64 AVX-512 DA3 projection candidate | parity PASS; A/B smoke remains noise-sensitive | Enabled behind `DA3_KERNELS_DISABLE_LINEAR` while further trials accumulate. |
 
 The accepted Flash kernel is an explicit local dependency of the production
 runtime. Future variants remain measurement-only until they beat it in an
