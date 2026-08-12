@@ -1064,4 +1064,45 @@ mod tests {
             assert!(output.iter().all(|value| *value == 0.0));
         }
     }
+
+    #[test]
+    fn fused_qk_norm_rope_matches_separate_scalar_operations_bitwise() {
+        const HEADS: usize = 12;
+        const TOKENS: usize = DA3_BASE_TOKENS_504X336;
+        const DIM: usize = 64;
+        let source: Vec<f32> = (0..HEADS * TOKENS * DIM)
+            .map(|i| ((i * 31 % 997) as f32 - 498.0) * 0.001)
+            .collect();
+        let gamma: Vec<f32> = (0..DIM).map(|i| 0.8 + i as f32 * 0.003).collect();
+        let beta: Vec<f32> = (0..DIM).map(|i| -0.1 + i as f32 * 0.002).collect();
+        let positions: Vec<i64> = (0..TOKENS)
+            .flat_map(|i| [(i / 24) as i64, (i % 24) as i64])
+            .collect();
+        let mut fused_q = source.clone();
+        let mut fused_k = source.clone();
+        assert!(qk_norm_rope_f32_da3_base(
+            &mut fused_q,
+            &mut fused_k,
+            &gamma,
+            &beta,
+            &gamma,
+            &beta,
+            &positions,
+            100.0,
+            1e-5,
+        ));
+        let rotations = rope_rotations(&positions, 100.0);
+        let mut separate_q = source.clone();
+        let mut separate_k = source;
+        normalize_and_rotate(&mut separate_q, &gamma, &beta, 1e-5, &rotations);
+        normalize_and_rotate(&mut separate_k, &gamma, &beta, 1e-5, &rotations);
+        assert_eq!(
+            fused_q.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            separate_q.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            fused_k.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            separate_k.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        );
+    }
 }
