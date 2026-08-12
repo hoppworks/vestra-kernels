@@ -396,6 +396,7 @@ unsafe fn flash_attention_avx512(
     const D: usize = 64;
     const QT: usize = 64;
     const KVT: usize = 64;
+    const PACKED_TOKENS: usize = 896;
     let scale = 1.0f32 / 8.0;
 
     out.par_chunks_mut(tokens * D)
@@ -406,6 +407,21 @@ unsafe fn flash_attention_avx512(
             let q_head = &q[base..base + tokens * D];
             let k_head = &k[base..base + tokens * D];
             let v_head = &v[base..base + tokens * D];
+
+            // K is immutable for every query tile of this head. Pack it once
+            // in dimension-major form, including zero padding for the tail,
+            // instead of repeating the same transpose fourteen times.
+            let mut packed_k_head = vec![0.0f32; D * PACKED_TOKENS];
+            if std::env::var_os("DA3_KERNELS_DISABLE_FLASH_HEAD_PACK").is_some() {
+                // Retain the old per-tile path below when explicitly A/Bing.
+                packed_k_head.clear();
+            } else {
+                for key in 0..tokens {
+                    for dim in 0..D {
+                        packed_k_head[dim * PACKED_TOKENS + key] = k_head[key * D + dim];
+                    }
+                }
+            }
 
             // One 64-query tile is large enough to amortise K packing. Nested
             // Rayon exposes the 14 tiles per head rather than limiting this
@@ -422,14 +438,20 @@ unsafe fn flash_attention_avx512(
 
                     for k0 in (0..tokens).step_by(KVT) {
                         let cols = (tokens - k0).min(KVT);
-                        let mut packed_k = [0.0f32; KVT * D];
                         let mut packed_v = [0.0f32; KVT * D];
-                        for key in 0..cols {
-                            let source = &k_head[(k0 + key) * D..(k0 + key + 1) * D];
-                            let value = &v_head[(k0 + key) * D..(k0 + key + 1) * D];
-                            for dim in 0..D {
-                                packed_k[dim * KVT + key] = source[dim];
-                                packed_v[key * D + dim] = value[dim];
+                        let mut packed_k = [0.0f32; KVT * D];
+                        if packed_k_head.is_empty() {
+                            for key in 0..cols {
+                                let source = &k_head[(k0 + key) * D..(k0 + key + 1) * D];
+                                for dim in 0..D {
+                                    packed_k[dim * KVT + key] = source[dim];
+                                }
+                            }
+                        }
+                        if cols < KVT {
+                            for key in 0..cols {
+                                packed_v[key * D..(key + 1) * D]
+                                    .copy_from_slice(&v_head[(k0 + key) * D..(k0 + key + 1) * D]);
                             }
                         }
 
@@ -437,12 +459,23 @@ unsafe fn flash_attention_avx512(
                         // SAFETY: fixed 64-wide packed matrices, and `rows`
                         // never exceeds the 64-row query tile.
                         unsafe {
-                            gemm_4x64_accumulate(
-                                rows,
-                                &q_head[q0 * D..(q0 + rows) * D],
-                                &packed_k,
-                                &mut scores,
-                            )
+                            if packed_k_head.is_empty() {
+                                gemm_4x64_accumulate(
+                                    rows,
+                                    &q_head[q0 * D..(q0 + rows) * D],
+                                    &packed_k,
+                                    &mut scores,
+                                )
+                            } else {
+                                gemm_4x64_accumulate_stride(
+                                    rows,
+                                    &q_head[q0 * D..(q0 + rows) * D],
+                                    &packed_k_head,
+                                    PACKED_TOKENS,
+                                    k0,
+                                    &mut scores,
+                                )
+                            }
                         };
 
                         for row in 0..rows {
@@ -478,7 +511,18 @@ unsafe fn flash_attention_avx512(
 
                         // SAFETY: scores and V are 64-column matrices and the
                         // accumulator has one 64-float row per valid query.
-                        unsafe { gemm_4x64_accumulate(rows, &scores, &packed_v, &mut accum) };
+                        unsafe {
+                            if cols == KVT {
+                                gemm_4x64_accumulate(
+                                    rows,
+                                    &scores,
+                                    &v_head[k0 * D..(k0 + KVT) * D],
+                                    &mut accum,
+                                )
+                            } else {
+                                gemm_4x64_accumulate(rows, &scores, &packed_v, &mut accum)
+                            }
+                        };
                     }
 
                     for row in 0..rows {
@@ -489,6 +533,56 @@ unsafe fn flash_attention_avx512(
                     }
                 });
         });
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn gemm_4x64_accumulate_stride(
+    m: usize,
+    a: &[f32],
+    b: &[f32],
+    stride: usize,
+    column: usize,
+    c: &mut [f32],
+) {
+    use core::arch::x86_64::*;
+    for row0 in (0..m).step_by(4) {
+        let rows = (m - row0).min(4);
+        let mut acc = [[_mm512_setzero_ps(); 4]; 4];
+        for row in 0..rows {
+            for block in 0..4 {
+                acc[row][block] =
+                    unsafe { _mm512_loadu_ps(c.as_ptr().add((row0 + row) * 64 + block * 16)) };
+            }
+        }
+        for kk in 0..64 {
+            let bp = unsafe { b.as_ptr().add(kk * stride + column) };
+            let bv = unsafe {
+                [
+                    _mm512_loadu_ps(bp),
+                    _mm512_loadu_ps(bp.add(16)),
+                    _mm512_loadu_ps(bp.add(32)),
+                    _mm512_loadu_ps(bp.add(48)),
+                ]
+            };
+            for row in 0..rows {
+                let av = _mm512_set1_ps(a[(row0 + row) * 64 + kk]);
+                for block in 0..4 {
+                    acc[row][block] = _mm512_fmadd_ps(av, bv[block], acc[row][block]);
+                }
+            }
+        }
+        for row in 0..rows {
+            for block in 0..4 {
+                unsafe {
+                    _mm512_storeu_ps(
+                        c.as_mut_ptr().add((row0 + row) * 64 + block * 16),
+                        acc[row][block],
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// C[m,64] += A[m,64] × B[64,64], with the same 4×64 AVX-512 tile shape as
