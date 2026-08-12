@@ -152,6 +152,91 @@ pub fn linear_f32_da3_base(
     false
 }
 
+/// The output-projection/FC2 form of the fixed DA3 kernel, with its two
+/// rowwise epilogue passes folded into the final stores.
+pub fn linear_bias_scale_f32_da3_base(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    scale: &[f32],
+    c: &mut [f32],
+) -> bool {
+    if std::env::var_os("DA3_KERNELS_DISABLE_LINEAR_EPILOGUE").is_some()
+        || m != DA3_BASE_TOKENS_504X336
+        || !matches!((k, n), (768, 768) | (3072, 768))
+        || a.len() != m * k
+        || b.len() != k * n
+        || bias.len() != n
+        || scale.len() != n
+        || c.len() != m * n
+    {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
+        unsafe { linear_bias_scale_avx512(m, n, k, a, b, bias, scale, c) };
+        return true;
+    }
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn linear_bias_scale_avx512(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    scale: &[f32],
+    c: &mut [f32],
+) {
+    use core::arch::x86_64::*;
+    use rayon::prelude::*;
+    const ROWS: usize = 6;
+    c.par_chunks_mut(ROWS * n)
+        .enumerate()
+        .for_each(|(tile, c_tile)| {
+            let row0 = tile * ROWS;
+            let rows = (m - row0).min(ROWS);
+            for col0 in (0..n).step_by(64) {
+                let mut acc = [[_mm512_setzero_ps(); 4]; ROWS];
+                for kk in 0..k {
+                    let bp = unsafe { b.as_ptr().add(kk * n + col0) };
+                    let bv = unsafe {
+                        [
+                            _mm512_loadu_ps(bp),
+                            _mm512_loadu_ps(bp.add(16)),
+                            _mm512_loadu_ps(bp.add(32)),
+                            _mm512_loadu_ps(bp.add(48)),
+                        ]
+                    };
+                    for row in 0..rows {
+                        let av = _mm512_set1_ps(a[(row0 + row) * k + kk]);
+                        for block in 0..4 {
+                            acc[row][block] = _mm512_fmadd_ps(av, bv[block], acc[row][block]);
+                        }
+                    }
+                }
+                for row in 0..rows {
+                    for block in 0..4 {
+                        let offset = col0 + block * 16;
+                        let bias_v = unsafe { _mm512_loadu_ps(bias.as_ptr().add(offset)) };
+                        let scale_v = unsafe { _mm512_loadu_ps(scale.as_ptr().add(offset)) };
+                        let out = _mm512_mul_ps(_mm512_add_ps(acc[row][block], bias_v), scale_v);
+                        unsafe {
+                            _mm512_storeu_ps(c_tile.as_mut_ptr().add(row * n + offset), out);
+                        }
+                    }
+                }
+            }
+        });
+}
+
 /// Computes DA3-BASE's fused QKV projection directly into the head-major
 /// buffers consumed by attention, avoiding the token-major 3×768 staging
 /// tensor and its subsequent transpose.
