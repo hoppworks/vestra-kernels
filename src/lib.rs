@@ -460,14 +460,14 @@ unsafe fn flash_attention_avx512(
                         // never exceeds the 64-row query tile.
                         unsafe {
                             if packed_k_head.is_empty() {
-                                gemm_4x64_accumulate(
+                                gemm_4x64_overwrite(
                                     rows,
                                     &q_head[q0 * D..(q0 + rows) * D],
                                     &packed_k,
                                     &mut scores,
                                 )
                             } else {
-                                gemm_4x64_accumulate_stride(
+                                gemm_4x64_overwrite_stride(
                                     rows,
                                     &q_head[q0 * D..(q0 + rows) * D],
                                     &packed_k_head,
@@ -537,7 +537,44 @@ unsafe fn flash_attention_avx512(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,fma")]
-unsafe fn gemm_4x64_accumulate_stride(
+unsafe fn gemm_4x64_overwrite(m: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+    use core::arch::x86_64::*;
+    for row0 in (0..m).step_by(4) {
+        let rows = (m - row0).min(4);
+        let mut acc = [[_mm512_setzero_ps(); 4]; 4];
+        for kk in 0..64 {
+            let bp = unsafe { b.as_ptr().add(kk * 64) };
+            let bv = unsafe {
+                [
+                    _mm512_loadu_ps(bp),
+                    _mm512_loadu_ps(bp.add(16)),
+                    _mm512_loadu_ps(bp.add(32)),
+                    _mm512_loadu_ps(bp.add(48)),
+                ]
+            };
+            for row in 0..rows {
+                let av = _mm512_set1_ps(a[(row0 + row) * 64 + kk]);
+                for block in 0..4 {
+                    acc[row][block] = _mm512_fmadd_ps(av, bv[block], acc[row][block]);
+                }
+            }
+        }
+        for row in 0..rows {
+            for block in 0..4 {
+                unsafe {
+                    _mm512_storeu_ps(
+                        c.as_mut_ptr().add((row0 + row) * 64 + block * 16),
+                        acc[row][block],
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn gemm_4x64_overwrite_stride(
     m: usize,
     a: &[f32],
     b: &[f32],
@@ -549,12 +586,6 @@ unsafe fn gemm_4x64_accumulate_stride(
     for row0 in (0..m).step_by(4) {
         let rows = (m - row0).min(4);
         let mut acc = [[_mm512_setzero_ps(); 4]; 4];
-        for row in 0..rows {
-            for block in 0..4 {
-                acc[row][block] =
-                    unsafe { _mm512_loadu_ps(c.as_ptr().add((row0 + row) * 64 + block * 16)) };
-            }
-        }
         for kk in 0..64 {
             let bp = unsafe { b.as_ptr().add(kk * stride + column) };
             let bv = unsafe {
