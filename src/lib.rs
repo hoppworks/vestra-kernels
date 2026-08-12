@@ -27,6 +27,9 @@ pub fn flash_attention_f32_da3_base(
     tokens: usize,
     out: &mut [f32],
 ) -> bool {
+    if std::env::var_os("DA3_KERNELS_DISABLE_FLASH").is_some() {
+        return false;
+    }
     if tokens != DA3_BASE_TOKENS_504X336
         || q.len() != heads * tokens * 64
         || k.len() != q.len()
