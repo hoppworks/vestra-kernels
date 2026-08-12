@@ -83,49 +83,38 @@ unsafe fn flash_attention_avx512(
                 .for_each(|(tile, out_tile)| {
                     let q0 = tile * QT;
                     let rows = out_tile.len() / D;
-                    let mut accum = [[0.0f32; D]; QT];
+                    let mut accum = [0.0f32; QT * D];
                     let mut sums = [0.0f32; QT];
                     let mut maxima = [f32::NEG_INFINITY; QT];
 
                     for k0 in (0..tokens).step_by(KVT) {
                         let cols = (tokens - k0).min(KVT);
-                        let mut packed_k = [[0.0f32; KVT]; D];
+                        let mut packed_k = [0.0f32; KVT * D];
+                        let mut packed_v = [0.0f32; KVT * D];
                         for key in 0..cols {
                             let source = &k_head[(k0 + key) * D..(k0 + key + 1) * D];
+                            let value = &v_head[(k0 + key) * D..(k0 + key + 1) * D];
                             for dim in 0..D {
-                                packed_k[dim][key] = source[dim];
+                                packed_k[dim * KVT + key] = source[dim];
+                                packed_v[key * D + dim] = value[dim];
                             }
                         }
 
-                        let mut scores = [[f32::NEG_INFINITY; KVT]; QT];
-                        for row in 0..rows {
-                            let query = &q_head[(q0 + row) * D..(q0 + row + 1) * D];
-                            let mut score_vectors = [_mm512_setzero_ps(); 4];
-                            for dim in 0..D {
-                                let qv = _mm512_set1_ps(query[dim]);
-                                let kp = packed_k[dim].as_ptr();
-                                for block in 0..4 {
-                                    // SAFETY: the fixed 64-key tile has four full
-                                    // sixteen-float blocks; `kp` points into it.
-                                    let kv = unsafe { _mm512_loadu_ps(kp.add(block * 16)) };
-                                    score_vectors[block] =
-                                        _mm512_fmadd_ps(qv, kv, score_vectors[block]);
-                                }
-                            }
-                            for block in 0..4 {
-                                // SAFETY: score rows are fixed 64-float tiles.
-                                unsafe {
-                                    _mm512_storeu_ps(
-                                        scores[row].as_mut_ptr().add(block * 16),
-                                        score_vectors[block],
-                                    );
-                                }
-                            }
-                        }
+                        let mut scores = [0.0f32; QT * KVT];
+                        // SAFETY: fixed 64-wide packed matrices, and `rows`
+                        // never exceeds the 64-row query tile.
+                        unsafe {
+                            gemm_4x64_accumulate(
+                                rows,
+                                &q_head[q0 * D..(q0 + rows) * D],
+                                &packed_k,
+                                &mut scores,
+                            )
+                        };
 
                         for row in 0..rows {
                             let mut tile_max = f32::NEG_INFINITY;
-                            for value in &mut scores[row][..cols] {
+                            for value in &mut scores[row * KVT..row * KVT + cols] {
                                 *value *= scale;
                                 tile_max = tile_max.max(*value);
                             }
@@ -136,51 +125,83 @@ unsafe fn flash_attention_avx512(
                                 0.0
                             };
                             sums[row] *= correction;
-                            for dim in 0..D {
-                                accum[row][dim] *= correction;
+                            for value in &mut accum[row * D..(row + 1) * D] {
+                                *value *= correction;
                             }
-                            for value in &mut scores[row][..cols] {
+                            for value in &mut scores[row * KVT..row * KVT + cols] {
                                 *value -= new_max;
                             }
+                            let score_row: &mut [f32; KVT] = scores[row * KVT..(row + 1) * KVT]
+                                .try_into()
+                                .expect("fixed score tile");
                             // SAFETY: every score row is the fixed 64-key tile.
-                            unsafe { exp_64_avx512(&mut scores[row]) };
-                            for value in &scores[row][..cols] {
+                            unsafe { exp_64_avx512(score_row) };
+                            for value in &score_row[..cols] {
                                 sums[row] += *value;
                             }
                             maxima[row] = new_max;
                         }
 
-                        for row in 0..rows {
-                            let mut result = [_mm512_setzero_ps(); 4];
-                            for key in 0..cols {
-                                let probability = _mm512_set1_ps(scores[row][key]);
-                                let value = &v_head[(k0 + key) * D..(k0 + key + 1) * D];
-                                for block in 0..4 {
-                                    // SAFETY: every value row has exactly 64 dims.
-                                    let vv =
-                                        unsafe { _mm512_loadu_ps(value.as_ptr().add(block * 16)) };
-                                    result[block] = _mm512_fmadd_ps(probability, vv, result[block]);
-                                }
-                            }
-                            for block in 0..4 {
-                                let mut partial = [0.0f32; 16];
-                                // SAFETY: `partial` has one complete ZMM width.
-                                unsafe { _mm512_storeu_ps(partial.as_mut_ptr(), result[block]) };
-                                for lane in 0..16 {
-                                    accum[row][block * 16 + lane] += partial[lane];
-                                }
-                            }
-                        }
+                        // SAFETY: scores and V are 64-column matrices and the
+                        // accumulator has one 64-float row per valid query.
+                        unsafe { gemm_4x64_accumulate(rows, &scores, &packed_v, &mut accum) };
                     }
 
                     for row in 0..rows {
                         let inverse_sum = 1.0 / sums[row];
                         for dim in 0..D {
-                            out_tile[row * D + dim] = accum[row][dim] * inverse_sum;
+                            out_tile[row * D + dim] = accum[row * D + dim] * inverse_sum;
                         }
                     }
                 });
         });
+}
+
+/// C[m,64] += A[m,64] × B[64,64], with the same 4×64 AVX-512 tile shape as
+/// ggml's CPU flash-attention helper. `m` is at most 64.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn gemm_4x64_accumulate(m: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+    use core::arch::x86_64::*;
+    debug_assert!(m <= 64 && a.len() >= m * 64 && b.len() >= 64 * 64 && c.len() >= m * 64);
+    for row0 in (0..m).step_by(4) {
+        let rows = (m - row0).min(4);
+        let mut acc = [[_mm512_setzero_ps(); 4]; 4];
+        for row in 0..rows {
+            for block in 0..4 {
+                // SAFETY: all matrices have complete 64-wide rows.
+                acc[row][block] =
+                    unsafe { _mm512_loadu_ps(c.as_ptr().add((row0 + row) * 64 + block * 16)) };
+            }
+        }
+        for kk in 0..64 {
+            let bp = unsafe { b.as_ptr().add(kk * 64) };
+            let bv = unsafe {
+                [
+                    _mm512_loadu_ps(bp),
+                    _mm512_loadu_ps(bp.add(16)),
+                    _mm512_loadu_ps(bp.add(32)),
+                    _mm512_loadu_ps(bp.add(48)),
+                ]
+            };
+            for row in 0..rows {
+                let av = _mm512_set1_ps(a[(row0 + row) * 64 + kk]);
+                for block in 0..4 {
+                    acc[row][block] = _mm512_fmadd_ps(av, bv[block], acc[row][block]);
+                }
+            }
+        }
+        for row in 0..rows {
+            for block in 0..4 {
+                unsafe {
+                    _mm512_storeu_ps(
+                        c.as_mut_ptr().add((row0 + row) * 64 + block * 16),
+                        acc[row][block],
+                    )
+                };
+            }
+        }
+    }
 }
 
 /// Cephes-style vector exponential. Keeping the score tile at 64 values lets
