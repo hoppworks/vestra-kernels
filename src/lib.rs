@@ -81,17 +81,19 @@ pub fn linear_f32_da3_base(
 unsafe fn linear_avx512(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
     use core::arch::x86_64::*;
     use rayon::prelude::*;
-    const ROWS: usize = 6;
+    const ROWS: usize = 8;
+    const COLS: usize = 48;
+    const VECTORS: usize = 3;
     c.par_chunks_mut(ROWS * n)
         .enumerate()
         .for_each(|(tile, c_tile)| {
             let row0 = tile * ROWS;
             let rows = (m - row0).min(ROWS);
-            for col0 in (0..n).step_by(64) {
-                let mut acc = [[_mm512_setzero_ps(); 4]; ROWS];
+            for col0 in (0..n).step_by(COLS) {
+                let mut acc = [[_mm512_setzero_ps(); VECTORS]; ROWS];
                 for row in 0..rows {
-                    for block in 0..4 {
-                        // SAFETY: all selected rows and 64-column tiles are in bounds.
+                    for block in 0..VECTORS {
+                        // SAFETY: all selected rows and 48-column tiles are in bounds.
                         acc[row][block] = unsafe {
                             _mm512_loadu_ps(c_tile.as_ptr().add(row * n + col0 + block * 16))
                         };
@@ -104,18 +106,17 @@ unsafe fn linear_avx512(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &
                             _mm512_loadu_ps(bp),
                             _mm512_loadu_ps(bp.add(16)),
                             _mm512_loadu_ps(bp.add(32)),
-                            _mm512_loadu_ps(bp.add(48)),
                         ]
                     };
                     for row in 0..rows {
                         let av = _mm512_set1_ps(a[(row0 + row) * k + kk]);
-                        for block in 0..4 {
+                        for block in 0..VECTORS {
                             acc[row][block] = _mm512_fmadd_ps(av, bv[block], acc[row][block]);
                         }
                     }
                 }
                 for row in 0..rows {
-                    for block in 0..4 {
+                    for block in 0..VECTORS {
                         unsafe {
                             _mm512_storeu_ps(
                                 c_tile.as_mut_ptr().add(row * n + col0 + block * 16),
