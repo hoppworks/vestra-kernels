@@ -92,6 +92,33 @@ extern "C" __global__ void vestra_layernorm_f32(
         output[base + col] = (input[base + col] - mean) * inv_stddev * gamma[col] + beta[col];
     }
 }
+
+// Strict-parity variant: one CUDA thread owns each row and deliberately
+// preserves the CPU scalar reduction order. It is an oracle route, not the
+// eventual throughput kernel.
+extern "C" __global__ void vestra_layernorm_f32_cpu_order(
+    const float* input,
+    const float* gamma,
+    const float* beta,
+    float* output,
+    float epsilon,
+    unsigned int cols
+) {
+    const unsigned int row = blockIdx.x;
+    const unsigned int base = row * cols;
+    float sum = 0.0f;
+    for (unsigned int col = 0; col < cols; ++col) sum += input[base + col];
+    const float mean = sum / (float)cols;
+    float variance_sum = 0.0f;
+    for (unsigned int col = 0; col < cols; ++col) {
+        const float delta = input[base + col] - mean;
+        variance_sum += delta * delta;
+    }
+    const float inv_stddev = 1.0f / sqrtf(variance_sum / (float)cols + epsilon);
+    for (unsigned int col = 0; col < cols; ++col) {
+        output[base + col] = (input[base + col] - mean) * inv_stddev * gamma[col] + beta[col];
+    }
+}
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -124,6 +151,7 @@ pub struct CudaRuntime {
     bias_scale: CudaFunction,
     gelu: CudaFunction,
     layernorm: CudaFunction,
+    layernorm_cpu_order: CudaFunction,
     blas: Arc<CudaBlas>,
 }
 
@@ -152,6 +180,9 @@ impl CudaRuntime {
         let layernorm = module
             .load_function("vestra_layernorm_f32")
             .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
+        let layernorm_cpu_order = module
+            .load_function("vestra_layernorm_f32_cpu_order")
+            .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
         let blas = Arc::new(
             CudaBlas::new(stream.clone())
                 .map_err(|error| CudaError::Blas(format!("handle initialization: {error:?}")))?,
@@ -165,6 +196,7 @@ impl CudaRuntime {
             bias_scale,
             gelu,
             layernorm,
+            layernorm_cpu_order,
             blas,
         })
     }
@@ -373,6 +405,59 @@ impl CudaRuntime {
                     shared_mem_bytes: 0,
                 })
                 .map_err(|error| CudaError::Kernel(format!("LayerNorm launch: {error:?}")))?;
+        }
+        Ok(CudaTensorF32 {
+            data: output,
+            len: expected,
+        })
+    }
+
+    /// Strict CPU-order LayerNorm oracle. This intentionally launches one
+    /// thread per row; use it to establish end-to-end numerical parity before
+    /// replacing it with a proven parallel reduction strategy.
+    pub fn layernorm_f32_cpu_order(
+        &self,
+        input: &CudaTensorF32,
+        gamma: &CudaTensorF32,
+        beta: &CudaTensorF32,
+        rows: usize,
+        columns: usize,
+        epsilon: f32,
+    ) -> Result<CudaTensorF32, CudaError> {
+        let expected = rows.saturating_mul(columns);
+        if input.len != expected || gamma.len != columns || beta.len != columns {
+            return Err(CudaError::LengthMismatch {
+                destination: input.len,
+                source_len: expected,
+            });
+        }
+        let rows = u32::try_from(rows)
+            .map_err(|_| CudaError::Kernel("row count exceeds CUDA u32 indexing".into()))?;
+        let columns = u32::try_from(columns)
+            .map_err(|_| CudaError::Kernel("column count exceeds CUDA u32 indexing".into()))?;
+        let mut output = self
+            .stream
+            .clone_htod(&vec![0.0_f32; expected])
+            .map_err(|error| {
+                CudaError::Upload(format!("CPU-order LayerNorm output allocation: {error:?}"))
+            })?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.layernorm_cpu_order)
+                .arg(&input.data)
+                .arg(&gamma.data)
+                .arg(&beta.data)
+                .arg(&mut output)
+                .arg(&epsilon)
+                .arg(&columns)
+                .launch(LaunchConfig {
+                    grid_dim: (rows, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|error| {
+                    CudaError::Kernel(format!("CPU-order LayerNorm launch: {error:?}"))
+                })?;
         }
         Ok(CudaTensorF32 {
             data: output,
@@ -589,6 +674,20 @@ mod tests {
             assert!(
                 (actual - expected).abs() <= 2e-5,
                 "LayerNorm diverged: actual={actual}, expected={expected}"
+            );
+        }
+        let normalized = runtime
+            .layernorm_f32_cpu_order(&norm_input, &norm_gamma, &norm_beta, 2, 3, 1e-5)
+            .unwrap();
+        for (actual, expected) in runtime
+            .download_f32(&normalized)
+            .unwrap()
+            .iter()
+            .zip(expected)
+        {
+            assert!(
+                (actual - expected).abs() <= 2e-6,
+                "CPU-order LayerNorm diverged: actual={actual}, expected={expected}"
             );
         }
     }
