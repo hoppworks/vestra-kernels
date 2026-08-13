@@ -4,8 +4,8 @@
 //! shapes, ten warm measurements and median reporting. It is a feasibility
 //! tool only; the end-to-end benchmark remains the DA CLI protocol.
 
-use da3_kernels::{linear_bias_scale_f32_da3_base, linear_f32_da3_base, qkv_f32_da3_base};
 use std::time::Instant;
+use vestra_kernels::{linear_bias_scale_f32_da3_base, linear_f32_da3_base, qkv_f32_da3_base};
 
 const TOKENS: usize = 865;
 
