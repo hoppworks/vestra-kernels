@@ -284,6 +284,46 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Uploads immutable row-major linear parameters once. The returned plan
+    /// accepts and returns device tensors, so callers can chain projections
+    /// without re-uploading weights or materializing intermediate results.
+    pub fn prepare_linear_f32(
+        &self,
+        input_features: usize,
+        output_features: usize,
+        weight: &[f32],
+        bias: &[f32],
+        gamma: Option<&[f32]>,
+    ) -> Result<CudaLinearF32, CudaError> {
+        if weight.len() != input_features.saturating_mul(output_features)
+            || bias.len() != output_features
+            || gamma.is_some_and(|values| values.len() != output_features)
+        {
+            return Err(CudaError::Blas(format!(
+                "linear parameter shape K={input_features}, N={output_features} does not match weight={}, bias={}, gamma={}",
+                weight.len(),
+                bias.len(),
+                gamma.map_or(output_features, <[f32]>::len),
+            )));
+        }
+        let unit_gamma;
+        let gamma = match gamma {
+            Some(gamma) => gamma,
+            None => {
+                unit_gamma = vec![1.0; output_features];
+                &unit_gamma
+            }
+        };
+        Ok(CudaLinearF32 {
+            runtime: self.clone(),
+            input_features,
+            output_features,
+            weight: self.upload_f32(weight)?,
+            bias: self.upload_f32(bias)?,
+            gamma: self.upload_f32(gamma)?,
+        })
+    }
+
     #[must_use]
     pub fn context(&self) -> &Arc<CudaContext> {
         &self.context
@@ -300,6 +340,55 @@ impl CudaRuntime {
 pub struct CudaTensorF32 {
     data: CudaSlice<f32>,
     len: usize,
+}
+
+/// Immutable device-resident parameters for one row-major F32 projection.
+/// Construct it at model-load time through [`CudaRuntime::prepare_linear_f32`]
+/// and feed its output directly to the next device operator.
+pub struct CudaLinearF32 {
+    runtime: CudaRuntime,
+    input_features: usize,
+    output_features: usize,
+    weight: CudaTensorF32,
+    bias: CudaTensorF32,
+    gamma: CudaTensorF32,
+}
+
+impl CudaLinearF32 {
+    #[must_use]
+    pub const fn input_features(&self) -> usize {
+        self.input_features
+    }
+
+    #[must_use]
+    pub const fn output_features(&self) -> usize {
+        self.output_features
+    }
+
+    /// Computes `(input × weight + bias) × gamma` wholly on the device.
+    pub fn run(&self, input: &CudaTensorF32, rows: usize) -> Result<CudaTensorF32, CudaError> {
+        if input.len != rows.saturating_mul(self.input_features) {
+            return Err(CudaError::Blas(format!(
+                "linear input rows={rows}, K={} does not match device input length {}",
+                self.input_features, input.len
+            )));
+        }
+        let mut output = self.runtime.gemm_row_major_f32(
+            input,
+            &self.weight,
+            rows,
+            self.input_features,
+            self.output_features,
+        )?;
+        self.runtime.bias_scale_f32_in_place(
+            &mut output,
+            &self.bias,
+            &self.gamma,
+            rows,
+            self.output_features,
+        )?;
+        Ok(output)
+    }
 }
 
 impl CudaTensorF32 {
@@ -361,5 +450,21 @@ mod tests {
                 "GELU diverged: actual={actual}, expected={expected}"
             );
         }
+
+        let first = runtime
+            .prepare_linear_f32(
+                3,
+                2,
+                &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+                &[1.0, -4.0],
+                Some(&[0.5, 2.0]),
+            )
+            .unwrap();
+        let second = runtime
+            .prepare_linear_f32(2, 1, &[2.0, -1.0], &[3.0], None)
+            .unwrap();
+        let chained = first.run(&left, 2).unwrap();
+        let chained = second.run(&chained, 2).unwrap();
+        assert_eq!(runtime.download_f32(&chained).unwrap(), [-58.0, -157.0]);
     }
 }
