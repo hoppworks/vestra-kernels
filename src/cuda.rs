@@ -132,12 +132,12 @@ extern "C" __global__ void vestra_attention_online_f32(
     const float* qi = q + head_base + query * head_dim;
     float accum[64];
     for (unsigned int d = 0; d < head_dim; ++d) accum[d] = 0.0f;
-    float running_max = -INFINITY;
+    float running_max = -1.0e30f;
     float running_sum = 0.0f;
     for (unsigned int j0 = 0; j0 < tokens; j0 += 64) {
         const unsigned int j1 = min(j0 + 64, tokens);
         float scores[64];
-        float tile_max = -INFINITY;
+        float tile_max = -1.0e30f;
         for (unsigned int j = j0; j < j1; ++j) {
             float dot = 0.0f;
             const float* kj = k + head_base + j * head_dim;
