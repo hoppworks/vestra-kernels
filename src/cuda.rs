@@ -206,6 +206,44 @@ extern "C" __global__ void vestra_qk_norm_rope_f32(
     }
     for (unsigned int d = 0; d < 64; ++d) { q[base+d] = qrow[d]; k[base+d] = krow[d]; }
 }
+
+// Converts a token-major fused QKV projection `[tokens, 3, heads, head_dim]`
+// into the head-major layout consumed by the attention kernel. Every output
+// element is independent, so this is a pure device-side layout conversion.
+extern "C" __global__ void vestra_split_qkv_hnd_f32(
+    const float* qkv, float* q, float* k, float* v,
+    unsigned int tokens, unsigned int heads, unsigned int head_dim
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int per_token = heads * head_dim;
+    const unsigned int len = tokens * per_token;
+    if (index >= len) return;
+    const unsigned int token = index / per_token;
+    const unsigned int within = index % per_token;
+    const unsigned int source = token * (3 * per_token) + within;
+    const unsigned int head_major = (within / head_dim) * (tokens * head_dim)
+        + token * head_dim + (within % head_dim);
+    q[head_major] = qkv[source];
+    k[head_major] = qkv[source + per_token];
+    v[head_major] = qkv[source + 2 * per_token];
+}
+
+// Inverse layout conversion for the attention output: head-major
+// `[heads,tokens,head_dim]` to token-major `[tokens,heads*head_dim]`.
+extern "C" __global__ void vestra_hnd_to_token_f32(
+    const float* hnd, float* token_major,
+    unsigned int tokens, unsigned int heads, unsigned int head_dim
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int per_token = heads * head_dim;
+    const unsigned int len = tokens * per_token;
+    if (index >= len) return;
+    const unsigned int token = index / per_token;
+    const unsigned int within = index % per_token;
+    const unsigned int source = (within / head_dim) * (tokens * head_dim)
+        + token * head_dim + (within % head_dim);
+    token_major[index] = hnd[source];
+}
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -241,6 +279,8 @@ pub struct CudaRuntime {
     layernorm_cpu_order: CudaFunction,
     attention_online: CudaFunction,
     qk_norm_rope: CudaFunction,
+    split_qkv_hnd: CudaFunction,
+    hnd_to_token: CudaFunction,
     blas: Arc<CudaBlas>,
 }
 
@@ -278,6 +318,12 @@ impl CudaRuntime {
         let qk_norm_rope = module
             .load_function("vestra_qk_norm_rope_f32")
             .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
+        let split_qkv_hnd = module
+            .load_function("vestra_split_qkv_hnd_f32")
+            .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
+        let hnd_to_token = module
+            .load_function("vestra_hnd_to_token_f32")
+            .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
         let blas = Arc::new(
             CudaBlas::new(stream.clone())
                 .map_err(|error| CudaError::Blas(format!("handle initialization: {error:?}")))?,
@@ -294,6 +340,8 @@ impl CudaRuntime {
             layernorm_cpu_order,
             attention_online,
             qk_norm_rope,
+            split_qkv_hnd,
+            hnd_to_token,
             blas,
         })
     }
@@ -621,6 +669,112 @@ impl CudaRuntime {
         })
     }
 
+    /// Splits a device-resident token-major fused QKV projection
+    /// `[tokens, 3*heads*head_dim]` into the head-major Q/K/V tensors used by
+    /// CUDA attention. The conversion never materializes on the host.
+    pub fn split_qkv_hnd_f32(
+        &self,
+        qkv: &CudaTensorF32,
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<(CudaTensorF32, CudaTensorF32, CudaTensorF32), CudaError> {
+        let per_token = heads.saturating_mul(head_dim);
+        let expected_qkv = tokens.saturating_mul(per_token).saturating_mul(3);
+        if qkv.len != expected_qkv || per_token == 0 {
+            return Err(CudaError::LengthMismatch {
+                destination: qkv.len,
+                source_len: expected_qkv,
+            });
+        }
+        let len = tokens.saturating_mul(per_token);
+        let count = u32::try_from(len)
+            .map_err(|_| CudaError::Kernel("QKV layout length exceeds CUDA u32 indexing".into()))?;
+        let tokens = u32::try_from(tokens)
+            .map_err(|_| CudaError::Kernel("token count exceeds CUDA u32 indexing".into()))?;
+        let heads = u32::try_from(heads)
+            .map_err(|_| CudaError::Kernel("head count exceeds CUDA u32 indexing".into()))?;
+        let head_dim = u32::try_from(head_dim)
+            .map_err(|_| CudaError::Kernel("head dimension exceeds CUDA u32 indexing".into()))?;
+        let make_output = || {
+            self.stream
+                .clone_htod(&vec![0.0_f32; len])
+                .map_err(|error| {
+                    CudaError::Upload(format!("QKV layout output allocation: {error:?}"))
+                })
+        };
+        let mut q = make_output()?;
+        let mut k = make_output()?;
+        let mut v = make_output()?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.split_qkv_hnd)
+                .arg(&qkv.data)
+                .arg(&mut q)
+                .arg(&mut k)
+                .arg(&mut v)
+                .arg(&tokens)
+                .arg(&heads)
+                .arg(&head_dim)
+                .launch(LaunchConfig::for_num_elems(count))
+                .map_err(|error| CudaError::Kernel(format!("QKV split launch: {error:?}")))?;
+        }
+        Ok((
+            CudaTensorF32 { data: q, len },
+            CudaTensorF32 { data: k, len },
+            CudaTensorF32 { data: v, len },
+        ))
+    }
+
+    /// Converts device-resident head-major attention output
+    /// `[heads,tokens,head_dim]` into token-major `[tokens,heads*head_dim]`
+    /// for the output projection without a host transfer.
+    pub fn hnd_to_token_f32(
+        &self,
+        hnd: &CudaTensorF32,
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<CudaTensorF32, CudaError> {
+        let per_token = heads.saturating_mul(head_dim);
+        let len = tokens.saturating_mul(per_token);
+        if hnd.len != len || per_token == 0 {
+            return Err(CudaError::LengthMismatch {
+                destination: hnd.len,
+                source_len: len,
+            });
+        }
+        let count = u32::try_from(len).map_err(|_| {
+            CudaError::Kernel("attention layout length exceeds CUDA u32 indexing".into())
+        })?;
+        let tokens = u32::try_from(tokens)
+            .map_err(|_| CudaError::Kernel("token count exceeds CUDA u32 indexing".into()))?;
+        let heads = u32::try_from(heads)
+            .map_err(|_| CudaError::Kernel("head count exceeds CUDA u32 indexing".into()))?;
+        let head_dim = u32::try_from(head_dim)
+            .map_err(|_| CudaError::Kernel("head dimension exceeds CUDA u32 indexing".into()))?;
+        let mut output = self
+            .stream
+            .clone_htod(&vec![0.0_f32; len])
+            .map_err(|error| {
+                CudaError::Upload(format!("attention layout output allocation: {error:?}"))
+            })?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.hnd_to_token)
+                .arg(&hnd.data)
+                .arg(&mut output)
+                .arg(&tokens)
+                .arg(&heads)
+                .arg(&head_dim)
+                .launch(LaunchConfig::for_num_elems(count))
+                .map_err(|error| {
+                    CudaError::Kernel(format!("attention unpack launch: {error:?}"))
+                })?;
+        }
+        Ok(CudaTensorF32 { data: output, len })
+    }
+
     /// Fused CPU-order Q/K LayerNorm and 2D RoPE for DA3-BASE's fixed 64-wide
     /// head rows. `positions_yx` is device-resident `[tokens, 2]` F32.
     #[allow(clippy::too_many_arguments)]
@@ -933,6 +1087,51 @@ mod tests {
                 "online attention diverged: actual={actual}, expected={expected}"
             );
         }
+
+        // A deliberately non-square layout catches both token/head axes of
+        // the device-only QKV split and attention-output unpack boundaries.
+        let layout_tokens = 3;
+        let layout_heads = 2;
+        let layout_dim = 4;
+        let embed = layout_heads * layout_dim;
+        let qkv = deterministic_values(layout_tokens * 3 * embed, -0.4);
+        let qkv_d = runtime.upload_f32(&qkv).unwrap();
+        let (q_d, k_d, v_d) = runtime
+            .split_qkv_hnd_f32(&qkv_d, layout_tokens, layout_heads, layout_dim)
+            .unwrap();
+        let mut expected_q = vec![0.0; layout_tokens * embed];
+        let mut expected_k = vec![0.0; layout_tokens * embed];
+        let mut expected_v = vec![0.0; layout_tokens * embed];
+        for token in 0..layout_tokens {
+            for head in 0..layout_heads {
+                for dim in 0..layout_dim {
+                    let hnd = (head * layout_tokens + token) * layout_dim + dim;
+                    let source = token * 3 * embed + head * layout_dim + dim;
+                    expected_q[hnd] = qkv[source];
+                    expected_k[hnd] = qkv[source + embed];
+                    expected_v[hnd] = qkv[source + 2 * embed];
+                }
+            }
+        }
+        assert_eq!(runtime.download_f32(&q_d).unwrap(), expected_q);
+        assert_eq!(runtime.download_f32(&k_d).unwrap(), expected_k);
+        assert_eq!(runtime.download_f32(&v_d).unwrap(), expected_v);
+        let unpacked = runtime
+            .hnd_to_token_f32(&q_d, layout_tokens, layout_heads, layout_dim)
+            .unwrap();
+        let mut expected_token_major = vec![0.0; layout_tokens * embed];
+        for token in 0..layout_tokens {
+            for head in 0..layout_heads {
+                for dim in 0..layout_dim {
+                    expected_token_major[token * embed + head * layout_dim + dim] =
+                        expected_q[(head * layout_tokens + token) * layout_dim + dim];
+                }
+            }
+        }
+        assert_eq!(
+            runtime.download_f32(&unpacked).unwrap(),
+            expected_token_major
+        );
     }
 
     /// Actual DA3-BASE attention geometry. This is separately gated because
