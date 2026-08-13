@@ -284,6 +284,24 @@ extern "C" __global__ void vestra_patchify_nchw_f32(
     const unsigned int x = patch_x * patch + spatial % patch;
     patches[index] = image[(channel * height + y) * width + x];
 }
+
+// DA3-BASE token assembly for models without register tokens. It prefixes the
+// CLS row and applies the already interpolated positional embedding without a
+// host-side token buffer. The input patch rows and output are token-major.
+extern "C" __global__ void vestra_prepend_cls_add_pos_f32(
+    const float* patches, const float* cls, const float* position,
+    float* tokens, unsigned int patch_count, unsigned int embed
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int len = (patch_count + 1) * embed;
+    if (index >= len) return;
+    const unsigned int token = index / embed;
+    const unsigned int channel = index % embed;
+    const float value = token == 0
+        ? cls[channel]
+        : patches[(token - 1) * embed + channel];
+    tokens[index] = value + position[index];
+}
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -323,6 +341,7 @@ pub struct CudaRuntime {
     hnd_to_token: CudaFunction,
     token_to_chw: CudaFunction,
     patchify_nchw: CudaFunction,
+    prepend_cls_add_pos: CudaFunction,
     blas: Arc<CudaBlas>,
 }
 
@@ -372,6 +391,9 @@ impl CudaRuntime {
         let patchify_nchw = module
             .load_function("vestra_patchify_nchw_f32")
             .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
+        let prepend_cls_add_pos = module
+            .load_function("vestra_prepend_cls_add_pos_f32")
+            .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
         let blas = Arc::new(
             CudaBlas::new(stream.clone())
                 .map_err(|error| CudaError::Blas(format!("handle initialization: {error:?}")))?,
@@ -392,6 +414,7 @@ impl CudaRuntime {
             hnd_to_token,
             token_to_chw,
             patchify_nchw,
+            prepend_cls_add_pos,
             blas,
         })
     }
@@ -921,6 +944,55 @@ impl CudaRuntime {
         Ok(CudaTensorF32 { data: output, len })
     }
 
+    /// Prefixes DA3-BASE's CLS row and adds an interpolated positional grid to
+    /// token-major projected patches. DA3-BASE has no register-token tensor;
+    /// callers targeting a different model must use a separately qualified
+    /// assembly route rather than silently dropping register rows.
+    pub fn prepend_cls_add_pos_f32(
+        &self,
+        patches: &CudaTensorF32,
+        cls: &CudaTensorF32,
+        position: &CudaTensorF32,
+        patch_count: usize,
+        embed: usize,
+    ) -> Result<CudaTensorF32, CudaError> {
+        let tokens = patch_count.saturating_add(1);
+        let patch_len = patch_count.saturating_mul(embed);
+        let token_len = tokens.saturating_mul(embed);
+        if embed == 0 || patches.len != patch_len || cls.len != embed || position.len != token_len {
+            return Err(CudaError::Kernel(format!(
+                "invalid CUDA token assembly patches={}, cls={}, position={}, patch_count={patch_count}, embed={embed}",
+                patches.len, cls.len, position.len
+            )));
+        }
+        let count = u32::try_from(token_len)
+            .map_err(|_| CudaError::Kernel("token assembly exceeds CUDA u32 indexing".into()))?;
+        let patch_count = u32::try_from(patch_count)
+            .map_err(|_| CudaError::Kernel("patch count exceeds CUDA u32 indexing".into()))?;
+        let embed = u32::try_from(embed)
+            .map_err(|_| CudaError::Kernel("embedding width exceeds CUDA u32 indexing".into()))?;
+        let mut output = self
+            .stream
+            .clone_htod(&vec![0.0_f32; token_len])
+            .map_err(|error| CudaError::Upload(format!("token assembly allocation: {error:?}")))?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.prepend_cls_add_pos)
+                .arg(&patches.data)
+                .arg(&cls.data)
+                .arg(&position.data)
+                .arg(&mut output)
+                .arg(&patch_count)
+                .arg(&embed)
+                .launch(LaunchConfig::for_num_elems(count))
+                .map_err(|error| CudaError::Kernel(format!("token assembly launch: {error:?}")))?;
+        }
+        Ok(CudaTensorF32 {
+            data: output,
+            len: token_len,
+        })
+    }
+
     /// Fused CPU-order Q/K LayerNorm and 2D RoPE for DA3-BASE's fixed 64-wide
     /// head rows. `positions_yx` is device-resident `[tokens, 2]` F32.
     #[allow(clippy::too_many_arguments)]
@@ -1319,6 +1391,19 @@ mod tests {
                 25.0, 28.0, 29.0, 40.0, 41.0, 44.0, 45.0, 10.0, 11.0, 14.0, 15.0, 26.0, 27.0, 30.0,
                 31.0, 42.0, 43.0, 46.0, 47.0,
             ]
+        );
+
+        let patches = runtime.upload_f32(&[10.0, 20.0, 30.0, 40.0]).unwrap();
+        let cls = runtime.upload_f32(&[1.0, 2.0]).unwrap();
+        let position = runtime
+            .upload_f32(&[0.5, -0.5, 1.0, 2.0, -1.0, 3.0])
+            .unwrap();
+        let tokens = runtime
+            .prepend_cls_add_pos_f32(&patches, &cls, &position, 2, 2)
+            .unwrap();
+        assert_eq!(
+            runtime.download_f32(&tokens).unwrap(),
+            [1.5, 1.5, 11.0, 22.0, 29.0, 43.0]
         );
     }
 
