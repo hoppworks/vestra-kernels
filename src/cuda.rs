@@ -15,11 +15,26 @@ use cudarc::{
     nvrtc::compile_ptx,
 };
 
-const RESIDUAL_ADD_SOURCE: &str = r#"
+const CUDA_KERNEL_SOURCE: &str = r#"
 extern "C" __global__ void vestra_add_f32(float* destination, const float* source, unsigned int len) {
     const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index < len) {
         destination[index] += source[index];
+    }
+}
+
+extern "C" __global__ void vestra_bias_scale_f32(
+    float* values,
+    const float* bias,
+    const float* gamma,
+    unsigned int rows,
+    unsigned int cols
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int len = rows * cols;
+    if (index < len) {
+        const unsigned int column = index % cols;
+        values[index] = (values[index] + bias[column]) * gamma[column];
     }
 }
 "#;
@@ -51,6 +66,7 @@ pub struct CudaRuntime {
     stream: Arc<CudaStream>,
     _module: Arc<CudaModule>,
     residual_add: CudaFunction,
+    bias_scale: CudaFunction,
     blas: Arc<CudaBlas>,
 }
 
@@ -62,13 +78,16 @@ impl CudaRuntime {
             detail: format!("{error:?}"),
         })?;
         let stream = context.default_stream();
-        let ptx = compile_ptx(RESIDUAL_ADD_SOURCE)
+        let ptx = compile_ptx(CUDA_KERNEL_SOURCE)
             .map_err(|error| CudaError::Kernel(format!("NVRTC compile: {error:?}")))?;
         let module = context
             .load_module(ptx)
             .map_err(|error| CudaError::Kernel(format!("PTX load: {error:?}")))?;
         let residual_add = module
             .load_function("vestra_add_f32")
+            .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
+        let bias_scale = module
+            .load_function("vestra_bias_scale_f32")
             .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
         let blas = Arc::new(
             CudaBlas::new(stream.clone())
@@ -80,6 +99,7 @@ impl CudaRuntime {
             stream,
             _module: module,
             residual_add,
+            bias_scale,
             blas,
         })
     }
@@ -189,6 +209,44 @@ impl CudaRuntime {
         })
     }
 
+    /// Applies the DA3 linear epilogue `(values + bias) * gamma` per output
+    /// column without moving the GEMM output off the device.
+    pub fn bias_scale_f32_in_place(
+        &self,
+        values: &mut CudaTensorF32,
+        bias: &CudaTensorF32,
+        gamma: &CudaTensorF32,
+        rows: usize,
+        columns: usize,
+    ) -> Result<(), CudaError> {
+        let expected_values = rows.saturating_mul(columns);
+        if values.len != expected_values || bias.len != columns || gamma.len != columns {
+            return Err(CudaError::LengthMismatch {
+                destination: values.len,
+                source_len: expected_values,
+            });
+        }
+        let rows = u32::try_from(rows)
+            .map_err(|_| CudaError::Kernel("row count exceeds CUDA u32 indexing".into()))?;
+        let columns = u32::try_from(columns)
+            .map_err(|_| CudaError::Kernel("column count exceeds CUDA u32 indexing".into()))?;
+        let count = rows.checked_mul(columns).ok_or_else(|| {
+            CudaError::Kernel("bias-scale element count exceeds CUDA u32 indexing".into())
+        })?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.bias_scale)
+                .arg(&mut values.data)
+                .arg(&bias.data)
+                .arg(&gamma.data)
+                .arg(&rows)
+                .arg(&columns)
+                .launch(LaunchConfig::for_num_elems(count))
+                .map_err(|error| CudaError::Kernel(format!("bias-scale launch: {error:?}")))?;
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn context(&self) -> &Arc<CudaContext> {
         &self.context
@@ -243,6 +301,17 @@ mod tests {
         assert_eq!(
             runtime.download_f32(&product).unwrap(),
             [58.0, 64.0, 139.0, 154.0]
+        );
+
+        let bias = runtime.upload_f32(&[1.0, -4.0]).unwrap();
+        let gamma = runtime.upload_f32(&[0.5, 2.0]).unwrap();
+        let mut epilogue = product;
+        runtime
+            .bias_scale_f32_in_place(&mut epilogue, &bias, &gamma, 2, 2)
+            .unwrap();
+        assert_eq!(
+            runtime.download_f32(&epilogue).unwrap(),
+            [29.5, 120.0, 70.0, 300.0]
         );
     }
 }
