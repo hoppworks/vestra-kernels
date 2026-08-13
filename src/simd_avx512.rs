@@ -14,6 +14,7 @@ const LANES: usize = 16; // f32 lanes per __m512
 /// matching the accuracy needs of `erf_avx512` below. Operates on all 16
 /// lanes of `x` at once.
 #[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn exp_avx512(x: __m512) -> __m512 {
     let exp_hi = _mm512_set1_ps(88.376_26);
     let exp_lo = _mm512_set1_ps(-88.376_26);
@@ -66,6 +67,7 @@ unsafe fn exp_avx512(x: __m512) -> __m512 {
 /// In-place AVX-512 exponential with a scalar tail. This is the same
 /// approximation used by the AVX-512 GELU path above.
 #[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
 pub(crate) unsafe fn exp_in_place_avx512(values: &mut [f32]) {
     let main = values.len() - (values.len() % LANES);
     let mut i = 0;
@@ -83,6 +85,7 @@ pub(crate) unsafe fn exp_in_place_avx512(values: &mut [f32]) {
 /// result in F32 and avoids FMA; callers still validate full-model parity.
 #[inline]
 #[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
 pub(crate) unsafe fn dot_avx512(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     let main = a.len() - (a.len() % LANES);
@@ -109,6 +112,7 @@ pub(crate) unsafe fn dot_avx512(a: &[f32], b: &[f32]) -> f32 {
 
 #[inline]
 #[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
 pub(crate) unsafe fn scaled_add_avx512(dst: &mut [f32], scale: f32, src: &[f32]) {
     debug_assert_eq!(dst.len(), src.len());
     let scale_vec = _mm512_set1_ps(scale);
@@ -129,6 +133,7 @@ pub(crate) unsafe fn scaled_add_avx512(dst: &mut [f32], scale: f32, src: &[f32])
 /// as `scalar::erf` (|error| < 1.5e-7), so `gelu_avx512` stays within the
 /// tolerance band of `scalar::gelu`.
 #[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn erf_avx512(x: __m512) -> __m512 {
     let abs_mask = _mm512_set1_epi32(0x7fff_ffff);
 
@@ -170,6 +175,7 @@ unsafe fn erf_avx512(x: __m512) -> __m512 {
 /// See `scalar::gelu` for the reference implementation this must match
 /// within tolerance.
 #[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
 pub(crate) unsafe fn gelu_avx512(x: &mut [f32]) {
     const INV_SQRT2: f32 = 0.707_106_78;
     let inv_sqrt2 = _mm512_set1_ps(INV_SQRT2);
@@ -201,6 +207,7 @@ pub(crate) unsafe fn gelu_avx512(x: &mut [f32]) {
 /// In-place elementwise `dst += src`, trivial AVX-512F load/add/store with
 /// a scalar tail for the remainder (< 16 lanes).
 #[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
 pub(crate) unsafe fn add_avx512(dst: &mut [f32], src: &[f32]) {
     debug_assert_eq!(dst.len(), src.len());
     let n = dst.len();
@@ -247,6 +254,7 @@ pub(crate) unsafe fn add_avx512(dst: &mut [f32], src: &[f32]) {
 /// the "2 blocks per VNNI iteration" unrolling the optimization brief
 /// calls for (see `gemm_q8_0_avx512` below), not a separate optional pass.
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn dpbusd_pair_halves(bx: __m512i, by: __m512i) -> (i32, i32) {
     let off = _mm512_set1_epi8(-128i8); // 0x80 per byte
     let ax = _mm512_xor_si512(bx, off); // ax[i] = (bx[i] as u8).wrapping_add(128)
@@ -279,6 +287,7 @@ unsafe fn dpbusd_pair_halves(bx: __m512i, by: __m512i) -> (i32, i32) {
 /// in memory (a `d` sits between them) — the two 32-byte `qs` arrays are
 /// copied into a local 64-byte buffer before the single 512-bit load.
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+#[allow(unsafe_op_in_unsafe_fn)]
 pub(crate) unsafe fn gemm_q8_0_avx512(
     m: usize,
     n: usize,
