@@ -259,6 +259,31 @@ extern "C" __global__ void vestra_token_to_chw_f32(
     const unsigned int channel = index % channels;
     chw[channel * tokens + token] = token_major[index];
 }
+
+// Lowers a contiguous NCHW image into row-major, non-overlapping patch rows.
+// The row dimension follows the OIHW inner order: `[channel, patch_y, patch_x]`.
+extern "C" __global__ void vestra_patchify_nchw_f32(
+    const float* image, float* patches,
+    unsigned int height, unsigned int width,
+    unsigned int patch, unsigned int channels
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int patch_area = patch * patch;
+    const unsigned int row_width = channels * patch_area;
+    const unsigned int grid_width = width / patch;
+    const unsigned int patch_count = (height / patch) * grid_width;
+    const unsigned int len = patch_count * row_width;
+    if (index >= len) return;
+    const unsigned int patch_index = index / row_width;
+    const unsigned int within_patch = index % row_width;
+    const unsigned int channel = within_patch / patch_area;
+    const unsigned int spatial = within_patch % patch_area;
+    const unsigned int patch_y = patch_index / grid_width;
+    const unsigned int patch_x = patch_index % grid_width;
+    const unsigned int y = patch_y * patch + spatial / patch;
+    const unsigned int x = patch_x * patch + spatial % patch;
+    patches[index] = image[(channel * height + y) * width + x];
+}
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -297,6 +322,7 @@ pub struct CudaRuntime {
     split_qkv_hnd: CudaFunction,
     hnd_to_token: CudaFunction,
     token_to_chw: CudaFunction,
+    patchify_nchw: CudaFunction,
     blas: Arc<CudaBlas>,
 }
 
@@ -343,6 +369,9 @@ impl CudaRuntime {
         let token_to_chw = module
             .load_function("vestra_token_to_chw_f32")
             .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
+        let patchify_nchw = module
+            .load_function("vestra_patchify_nchw_f32")
+            .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
         let blas = Arc::new(
             CudaBlas::new(stream.clone())
                 .map_err(|error| CudaError::Blas(format!("handle initialization: {error:?}")))?,
@@ -362,6 +391,7 @@ impl CudaRuntime {
             split_qkv_hnd,
             hnd_to_token,
             token_to_chw,
+            patchify_nchw,
             blas,
         })
     }
@@ -835,6 +865,62 @@ impl CudaRuntime {
         Ok(CudaTensorF32 { data: output, len })
     }
 
+    /// Lowers an NCHW image into row-major non-overlapping patch rows on the
+    /// device. A following cached CUBLAS projection can consume the result
+    /// directly; no host-side im2col buffer is created.
+    pub fn patchify_nchw_f32(
+        &self,
+        image: &CudaTensorF32,
+        height: usize,
+        width: usize,
+        patch: usize,
+        channels: usize,
+    ) -> Result<CudaTensorF32, CudaError> {
+        if height == 0
+            || width == 0
+            || patch == 0
+            || channels == 0
+            || height % patch != 0
+            || width % patch != 0
+            || image.len != channels.saturating_mul(height).saturating_mul(width)
+        {
+            return Err(CudaError::Kernel(format!(
+                "invalid NCHW patchify shape image={}, channels={channels}, height={height}, width={width}, patch={patch}",
+                image.len
+            )));
+        }
+        let rows = (height / patch).saturating_mul(width / patch);
+        let columns = channels.saturating_mul(patch).saturating_mul(patch);
+        let len = rows.saturating_mul(columns);
+        let count = u32::try_from(len)
+            .map_err(|_| CudaError::Kernel("patchified tensor exceeds CUDA u32 indexing".into()))?;
+        let height = u32::try_from(height)
+            .map_err(|_| CudaError::Kernel("height exceeds CUDA u32 indexing".into()))?;
+        let width = u32::try_from(width)
+            .map_err(|_| CudaError::Kernel("width exceeds CUDA u32 indexing".into()))?;
+        let patch = u32::try_from(patch)
+            .map_err(|_| CudaError::Kernel("patch exceeds CUDA u32 indexing".into()))?;
+        let channels = u32::try_from(channels)
+            .map_err(|_| CudaError::Kernel("channels exceeds CUDA u32 indexing".into()))?;
+        let mut output = self
+            .stream
+            .clone_htod(&vec![0.0_f32; len])
+            .map_err(|error| CudaError::Upload(format!("patchify allocation: {error:?}")))?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.patchify_nchw)
+                .arg(&image.data)
+                .arg(&mut output)
+                .arg(&height)
+                .arg(&width)
+                .arg(&patch)
+                .arg(&channels)
+                .launch(LaunchConfig::for_num_elems(count))
+                .map_err(|error| CudaError::Kernel(format!("NCHW patchify launch: {error:?}")))?;
+        }
+        Ok(CudaTensorF32 { data: output, len })
+    }
+
     /// Fused CPU-order Q/K LayerNorm and 2D RoPE for DA3-BASE's fixed 64-wide
     /// head rows. `positions_yx` is device-resident `[tokens, 2]` F32.
     #[allow(clippy::too_many_arguments)]
@@ -1219,6 +1305,21 @@ mod tests {
             }
         }
         assert_eq!(runtime.download_f32(&chw).unwrap(), expected_chw);
+
+        // Patch rows must retain both the NCHW source contract and the
+        // OIHW-compatible inner dimension used by DA3's patch projection.
+        let image = (0..3 * 4 * 4).map(|index| index as f32).collect::<Vec<_>>();
+        let image = runtime.upload_f32(&image).unwrap();
+        let patches = runtime.patchify_nchw_f32(&image, 4, 4, 2, 3).unwrap();
+        assert_eq!(
+            runtime.download_f32(&patches).unwrap(),
+            vec![
+                0.0, 1.0, 4.0, 5.0, 16.0, 17.0, 20.0, 21.0, 32.0, 33.0, 36.0, 37.0, 2.0, 3.0, 6.0,
+                7.0, 18.0, 19.0, 22.0, 23.0, 34.0, 35.0, 38.0, 39.0, 8.0, 9.0, 12.0, 13.0, 24.0,
+                25.0, 28.0, 29.0, 40.0, 41.0, 44.0, 45.0, 10.0, 11.0, 14.0, 15.0, 26.0, 27.0, 30.0,
+                31.0, 42.0, 43.0, 46.0, 47.0,
+            ]
+        );
     }
 
     /// Actual DA3-BASE attention geometry. This is separately gated because
