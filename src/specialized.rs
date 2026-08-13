@@ -2050,10 +2050,12 @@ unsafe fn flash_attention_avx512(
     // old 4x64 path remains available for diagnostic A/B through this
     // explicit disable switch.
     let gemm_8x32 = std::env::var_os("DA3_KERNELS_DISABLE_FLASH_GEMM_8X32").is_none();
-    // Keeps the old generic QT8 helper available as a same-binary A/B
-    // control for the production-only stack-frame specialization below.
-    let packed_qt8 =
-        gemm_8x32 && std::env::var_os("DA3_KERNELS_DISABLE_FLASH_PACKED_QT8").is_none();
+    // The packed QT8 implementation is an experimental single-view fast path.
+    // It is intentionally opt-in: multi-view inference alternates local and
+    // global attention and must never enter an unvalidated unsafe kernel.
+    // `DA3_KERNELS_FLASH_PACKED_QT8=1` is reserved for isolated benchmark
+    // experiments with explicit parity and crash testing.
+    let packed_qt8 = gemm_8x32 && std::env::var_os("DA3_KERNELS_FLASH_PACKED_QT8").is_some();
     let nested_super16 = flash_nested_super16_from_env(
         std::env::var("DA3_KERNELS_FLASH_NESTED_SUPER16")
             .ok()
