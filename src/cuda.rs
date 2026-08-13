@@ -119,6 +119,49 @@ extern "C" __global__ void vestra_layernorm_f32_cpu_order(
         output[base + col] = (input[base + col] - mean) * inv_stddev * gamma[col] + beta[col];
     }
 }
+
+extern "C" __global__ void vestra_attention_online_f32(
+    const float* q, const float* k, const float* v, float* out,
+    unsigned int tokens, unsigned int head_dim, float scale, unsigned int rows
+) {
+    const unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    const unsigned int head = row / tokens;
+    const unsigned int query = row % tokens;
+    const unsigned int head_base = head * tokens * head_dim;
+    const float* qi = q + head_base + query * head_dim;
+    float accum[64];
+    for (unsigned int d = 0; d < head_dim; ++d) accum[d] = 0.0f;
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    for (unsigned int j0 = 0; j0 < tokens; j0 += 64) {
+        const unsigned int j1 = min(j0 + 64, tokens);
+        float scores[64];
+        float tile_max = -INFINITY;
+        for (unsigned int j = j0; j < j1; ++j) {
+            float dot = 0.0f;
+            const float* kj = k + head_base + j * head_dim;
+            for (unsigned int d = 0; d < head_dim; ++d) dot += qi[d] * kj[d];
+            const float score = dot * scale;
+            scores[j - j0] = score;
+            tile_max = fmaxf(tile_max, score);
+        }
+        const float new_max = fmaxf(running_max, tile_max);
+        const float correction = isfinite(running_max) ? expf(running_max - new_max) : 0.0f;
+        running_sum *= correction;
+        for (unsigned int d = 0; d < head_dim; ++d) accum[d] *= correction;
+        for (unsigned int j = j0; j < j1; ++j) {
+            const float p = expf(scores[j - j0] - new_max);
+            running_sum += p;
+            const float* vj = v + head_base + j * head_dim;
+            for (unsigned int d = 0; d < head_dim; ++d) accum[d] += p * vj[d];
+        }
+        running_max = new_max;
+    }
+    float* oi = out + head_base + query * head_dim;
+    const float inv_sum = 1.0f / running_sum;
+    for (unsigned int d = 0; d < head_dim; ++d) oi[d] = accum[d] * inv_sum;
+}
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -152,6 +195,7 @@ pub struct CudaRuntime {
     gelu: CudaFunction,
     layernorm: CudaFunction,
     layernorm_cpu_order: CudaFunction,
+    attention_online: CudaFunction,
     blas: Arc<CudaBlas>,
 }
 
@@ -183,6 +227,9 @@ impl CudaRuntime {
         let layernorm_cpu_order = module
             .load_function("vestra_layernorm_f32_cpu_order")
             .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
+        let attention_online = module
+            .load_function("vestra_attention_online_f32")
+            .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
         let blas = Arc::new(
             CudaBlas::new(stream.clone())
                 .map_err(|error| CudaError::Blas(format!("handle initialization: {error:?}")))?,
@@ -197,6 +244,7 @@ impl CudaRuntime {
             gelu,
             layernorm,
             layernorm_cpu_order,
+            attention_online,
             blas,
         })
     }
@@ -465,6 +513,65 @@ impl CudaRuntime {
         })
     }
 
+    /// Device-resident tiled online-softmax attention oracle for head-major
+    /// `[heads,tokens,head_dim]` F32 tensors. DA3-BASE uses `head_dim=64`;
+    /// the kernel deliberately bounds the private accumulator at that shape.
+    pub fn attention_online_f32(
+        &self,
+        q: &CudaTensorF32,
+        k: &CudaTensorF32,
+        v: &CudaTensorF32,
+        heads: usize,
+        tokens: usize,
+        head_dim: usize,
+    ) -> Result<CudaTensorF32, CudaError> {
+        if head_dim == 0 || head_dim > 64 {
+            return Err(CudaError::Kernel(format!(
+                "CUDA online attention supports 1..=64 head dimensions, got {head_dim}"
+            )));
+        }
+        let expected = heads.saturating_mul(tokens).saturating_mul(head_dim);
+        if q.len != expected || k.len != expected || v.len != expected {
+            return Err(CudaError::LengthMismatch {
+                destination: q.len,
+                source_len: expected,
+            });
+        }
+        let tokens = u32::try_from(tokens)
+            .map_err(|_| CudaError::Kernel("token count exceeds CUDA u32 indexing".into()))?;
+        let head_dim = u32::try_from(head_dim)
+            .map_err(|_| CudaError::Kernel("head dimension exceeds CUDA u32 indexing".into()))?;
+        let rows = u32::try_from(heads.saturating_mul(tokens as usize))
+            .map_err(|_| CudaError::Kernel("attention rows exceed CUDA u32 indexing".into()))?;
+        let mut output = self
+            .stream
+            .clone_htod(&vec![0.0_f32; expected])
+            .map_err(|error| {
+                CudaError::Upload(format!("attention output allocation: {error:?}"))
+            })?;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+        unsafe {
+            self.stream
+                .launch_builder(&self.attention_online)
+                .arg(&q.data)
+                .arg(&k.data)
+                .arg(&v.data)
+                .arg(&mut output)
+                .arg(&tokens)
+                .arg(&head_dim)
+                .arg(&scale)
+                .arg(&rows)
+                .launch(LaunchConfig::for_num_elems(rows))
+                .map_err(|error| {
+                    CudaError::Kernel(format!("online attention launch: {error:?}"))
+                })?;
+        }
+        Ok(CudaTensorF32 {
+            data: output,
+            len: expected,
+        })
+    }
+
     /// Uploads immutable row-major linear parameters once. The returned plan
     /// accepts and returns device tensors, so callers can chain projections
     /// without re-uploading weights or materializing intermediate results.
@@ -688,6 +795,32 @@ mod tests {
             assert!(
                 (actual - expected).abs() <= 2e-6,
                 "CPU-order LayerNorm diverged: actual={actual}, expected={expected}"
+            );
+        }
+
+        let heads = 2;
+        let tokens = 5;
+        let head_dim = 4;
+        let values = |seed: f32| {
+            (0..heads * tokens * head_dim)
+                .map(|index| (index as f32 * 0.03125 + seed).sin())
+                .collect::<Vec<_>>()
+        };
+        let q = values(0.1);
+        let k = values(-0.2);
+        let v = values(0.7);
+        let mut expected = vec![0.0; q.len()];
+        crate::attention::attention_naive(&q, &k, &v, heads, tokens, head_dim, &mut expected);
+        let q = runtime.upload_f32(&q).unwrap();
+        let k = runtime.upload_f32(&k).unwrap();
+        let v = runtime.upload_f32(&v).unwrap();
+        let actual = runtime
+            .attention_online_f32(&q, &k, &v, heads, tokens, head_dim)
+            .unwrap();
+        for (actual, expected) in runtime.download_f32(&actual).unwrap().iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() <= 5e-5,
+                "online attention diverged: actual={actual}, expected={expected}"
             );
         }
     }
