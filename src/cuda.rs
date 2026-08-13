@@ -52,6 +52,46 @@ extern "C" __global__ void vestra_gelu_f32(float* values, unsigned int len) {
         values[index] = 0.5f * x * (1.0f + erf);
     }
 }
+
+extern "C" __global__ void vestra_layernorm_f32(
+    const float* input,
+    const float* gamma,
+    const float* beta,
+    float* output,
+    float epsilon,
+    unsigned int cols
+) {
+    const unsigned int row = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int base = row * cols;
+    __shared__ float partial[256];
+
+    float sum = 0.0f;
+    for (unsigned int col = tid; col < cols; col += blockDim.x) sum += input[base + col];
+    partial[tid] = sum;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float mean = partial[0] / (float)cols;
+
+    float squared = 0.0f;
+    for (unsigned int col = tid; col < cols; col += blockDim.x) {
+        const float delta = input[base + col] - mean;
+        squared += delta * delta;
+    }
+    partial[tid] = squared;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float inv_stddev = rsqrtf(partial[0] / (float)cols + epsilon);
+    for (unsigned int col = tid; col < cols; col += blockDim.x) {
+        output[base + col] = (input[base + col] - mean) * inv_stddev * gamma[col] + beta[col];
+    }
+}
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -83,6 +123,7 @@ pub struct CudaRuntime {
     residual_add: CudaFunction,
     bias_scale: CudaFunction,
     gelu: CudaFunction,
+    layernorm: CudaFunction,
     blas: Arc<CudaBlas>,
 }
 
@@ -108,6 +149,9 @@ impl CudaRuntime {
         let gelu = module
             .load_function("vestra_gelu_f32")
             .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
+        let layernorm = module
+            .load_function("vestra_layernorm_f32")
+            .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
         let blas = Arc::new(
             CudaBlas::new(stream.clone())
                 .map_err(|error| CudaError::Blas(format!("handle initialization: {error:?}")))?,
@@ -120,6 +164,7 @@ impl CudaRuntime {
             residual_add,
             bias_scale,
             gelu,
+            layernorm,
             blas,
         })
     }
@@ -282,6 +327,57 @@ impl CudaRuntime {
                 .map_err(|error| CudaError::Kernel(format!("GELU launch: {error:?}")))?;
         }
         Ok(())
+    }
+
+    /// Computes row-major LayerNorm on the device. The one-block-per-row
+    /// reduction is deliberately fixed at 256 threads so DA3's 768-wide
+    /// token rows have stable launch geometry across every block.
+    pub fn layernorm_f32(
+        &self,
+        input: &CudaTensorF32,
+        gamma: &CudaTensorF32,
+        beta: &CudaTensorF32,
+        rows: usize,
+        columns: usize,
+        epsilon: f32,
+    ) -> Result<CudaTensorF32, CudaError> {
+        let expected = rows.saturating_mul(columns);
+        if input.len != expected || gamma.len != columns || beta.len != columns {
+            return Err(CudaError::LengthMismatch {
+                destination: input.len,
+                source_len: expected,
+            });
+        }
+        let rows = u32::try_from(rows)
+            .map_err(|_| CudaError::Kernel("row count exceeds CUDA u32 indexing".into()))?;
+        let columns = u32::try_from(columns)
+            .map_err(|_| CudaError::Kernel("column count exceeds CUDA u32 indexing".into()))?;
+        let mut output = self
+            .stream
+            .clone_htod(&vec![0.0_f32; expected])
+            .map_err(|error| {
+                CudaError::Upload(format!("LayerNorm output allocation: {error:?}"))
+            })?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.layernorm)
+                .arg(&input.data)
+                .arg(&gamma.data)
+                .arg(&beta.data)
+                .arg(&mut output)
+                .arg(&epsilon)
+                .arg(&columns)
+                .launch(LaunchConfig {
+                    grid_dim: (rows, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|error| CudaError::Kernel(format!("LayerNorm launch: {error:?}")))?;
+        }
+        Ok(CudaTensorF32 {
+            data: output,
+            len: expected,
+        })
     }
 
     /// Uploads immutable row-major linear parameters once. The returned plan
@@ -466,5 +562,34 @@ mod tests {
         let chained = first.run(&left, 2).unwrap();
         let chained = second.run(&chained, 2).unwrap();
         assert_eq!(runtime.download_f32(&chained).unwrap(), [-58.0, -157.0]);
+
+        let norm_input = runtime
+            .upload_f32(&[1.0, 2.0, 5.0, -2.0, 3.0, 4.0])
+            .unwrap();
+        let norm_gamma = runtime.upload_f32(&[1.5, 0.5, 2.0]).unwrap();
+        let norm_beta = runtime.upload_f32(&[-1.0, 0.25, 2.0]).unwrap();
+        let normalized = runtime
+            .layernorm_f32(&norm_input, &norm_gamma, &norm_beta, 2, 3, 1e-5)
+            .unwrap();
+        let mut expected = [1.0, 2.0, 5.0, -2.0, 3.0, 4.0];
+        crate::scalar::layernorm(
+            &mut expected,
+            2,
+            3,
+            &[1.5, 0.5, 2.0],
+            &[-1.0, 0.25, 2.0],
+            1e-5,
+        );
+        for (actual, expected) in runtime
+            .download_f32(&normalized)
+            .unwrap()
+            .iter()
+            .zip(expected)
+        {
+            assert!(
+                (actual - expected).abs() <= 2e-5,
+                "LayerNorm diverged: actual={actual}, expected={expected}"
+            );
+        }
     }
 }
