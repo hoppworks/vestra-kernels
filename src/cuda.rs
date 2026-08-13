@@ -37,6 +37,21 @@ extern "C" __global__ void vestra_bias_scale_f32(
         values[index] = (values[index] + bias[column]) * gamma[column];
     }
 }
+
+extern "C" __global__ void vestra_gelu_f32(float* values, unsigned int len) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < len) {
+        const float x = values[index];
+        const float ax = fabsf(x * 0.70710678f);
+        const float t = 1.0f / (1.0f + 0.3275911f * ax);
+        float poly = 1.0614054f * t - 1.4531520f;
+        poly = poly * t + 1.4214137f;
+        poly = poly * t - 0.28449674f;
+        poly = poly * t + 0.25482959f;
+        const float erf = copysignf(1.0f - poly * t * expf(-ax * ax), x);
+        values[index] = 0.5f * x * (1.0f + erf);
+    }
+}
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -67,6 +82,7 @@ pub struct CudaRuntime {
     _module: Arc<CudaModule>,
     residual_add: CudaFunction,
     bias_scale: CudaFunction,
+    gelu: CudaFunction,
     blas: Arc<CudaBlas>,
 }
 
@@ -89,6 +105,9 @@ impl CudaRuntime {
         let bias_scale = module
             .load_function("vestra_bias_scale_f32")
             .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
+        let gelu = module
+            .load_function("vestra_gelu_f32")
+            .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
         let blas = Arc::new(
             CudaBlas::new(stream.clone())
                 .map_err(|error| CudaError::Blas(format!("handle initialization: {error:?}")))?,
@@ -100,6 +119,7 @@ impl CudaRuntime {
             _module: module,
             residual_add,
             bias_scale,
+            gelu,
             blas,
         })
     }
@@ -247,6 +267,23 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Applies the DA3 exact-erf GELU approximation in place on the device.
+    /// This matches Vestra Kernels' Abramowitz–Stegun F32 formulation; final
+    /// Engine parity gates, rather than this primitive, own the tolerance.
+    pub fn gelu_f32_in_place(&self, values: &mut CudaTensorF32) -> Result<(), CudaError> {
+        let count = u32::try_from(values.len)
+            .map_err(|_| CudaError::Kernel("tensor length exceeds CUDA u32 indexing".into()))?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.gelu)
+                .arg(&mut values.data)
+                .arg(&count)
+                .launch(LaunchConfig::for_num_elems(count))
+                .map_err(|error| CudaError::Kernel(format!("GELU launch: {error:?}")))?;
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn context(&self) -> &Arc<CudaContext> {
         &self.context
@@ -313,5 +350,16 @@ mod tests {
             runtime.download_f32(&epilogue).unwrap(),
             [29.5, 120.0, 70.0, 300.0]
         );
+
+        let mut gelu = runtime.upload_f32(&[-3.0, -1.0, 0.0, 1.0, 3.0]).unwrap();
+        runtime.gelu_f32_in_place(&mut gelu).unwrap();
+        let mut expected = [-3.0, -1.0, 0.0, 1.0, 3.0];
+        crate::scalar::gelu(&mut expected);
+        for (actual, expected) in runtime.download_f32(&gelu).unwrap().iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() <= 2e-6,
+                "GELU diverged: actual={actual}, expected={expected}"
+            );
+        }
     }
 }
