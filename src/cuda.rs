@@ -995,6 +995,16 @@ impl CudaLinearF32 {
         )?;
         Ok(output)
     }
+
+    /// Computes the normal device-resident linear result and immediately
+    /// emits DPT-compatible CHW order. This is intentionally a method of the
+    /// cached plan so a DPT stage does not materialize the token-major result
+    /// on the host merely to transpose it.
+    pub fn run_chw(&self, input: &CudaTensorF32, rows: usize) -> Result<CudaTensorF32, CudaError> {
+        let token_major = self.run(input, rows)?;
+        self.runtime
+            .token_to_chw_f32(&token_major, rows, self.output_features)
+    }
 }
 
 impl CudaTensorF32 {
@@ -1078,6 +1088,11 @@ mod tests {
         let chained = first.run(&left, 2).unwrap();
         let chained = second.run(&chained, 2).unwrap();
         assert_eq!(runtime.download_f32(&chained).unwrap(), [-58.0, -157.0]);
+        let projected_chw = first.run_chw(&left, 2).unwrap();
+        assert_eq!(
+            runtime.download_f32(&projected_chw).unwrap(),
+            [29.5, 70.0, 120.0, 300.0]
+        );
 
         let norm_input = runtime
             .upload_f32(&[1.0, 2.0, 5.0, -2.0, 3.0, 4.0])
