@@ -162,6 +162,50 @@ extern "C" __global__ void vestra_attention_online_f32(
     const float inv_sum = 1.0f / running_sum;
     for (unsigned int d = 0; d < head_dim; ++d) oi[d] = accum[d] * inv_sum;
 }
+
+extern "C" __global__ void vestra_qk_norm_rope_f32(
+    float* q, float* k,
+    const float* q_gamma, const float* q_beta,
+    const float* k_gamma, const float* k_beta,
+    const float* positions_yx,
+    unsigned int tokens, float frequency, float epsilon, unsigned int rows
+) {
+    const unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    const unsigned int token = row % tokens;
+    const unsigned int base = row * 64;
+    float qsum = 0.0f, ksum = 0.0f;
+    for (unsigned int d = 0; d < 64; ++d) { qsum += q[base+d]; ksum += k[base+d]; }
+    const float qmean = qsum / 64.0f, kmean = ksum / 64.0f;
+    float qvar = 0.0f, kvar = 0.0f;
+    for (unsigned int d = 0; d < 64; ++d) {
+        const float qd = q[base+d] - qmean, kd = k[base+d] - kmean;
+        qvar += qd * qd; kvar += kd * kd;
+    }
+    const float qinv = 1.0f / sqrtf(qvar / 64.0f + epsilon);
+    const float kinv = 1.0f / sqrtf(kvar / 64.0f + epsilon);
+    float qrow[64], krow[64];
+    for (unsigned int d = 0; d < 64; ++d) {
+        qrow[d] = (q[base+d] - qmean) * qinv * q_gamma[d] + q_beta[d];
+        krow[d] = (k[base+d] - kmean) * kinv * k_gamma[d] + k_beta[d];
+    }
+    const float y = positions_yx[2 * token], x = positions_yx[2 * token + 1];
+    for (unsigned int axis = 0; axis < 2; ++axis) {
+        const float pos = axis == 0 ? y : x;
+        const unsigned int offset = axis * 32;
+        for (unsigned int i = 0; i < 16; ++i) {
+            const float theta = powf(frequency, -2.0f * (float)i / 32.0f);
+            const float sine = sinf(pos * theta), cosine = cosf(pos * theta);
+            const float qa = qrow[offset+i], qb = qrow[offset+i+16];
+            const float ka = krow[offset+i], kb = krow[offset+i+16];
+            qrow[offset+i] = qa * cosine - qb * sine;
+            qrow[offset+i+16] = qb * cosine + qa * sine;
+            krow[offset+i] = ka * cosine - kb * sine;
+            krow[offset+i+16] = kb * cosine + ka * sine;
+        }
+    }
+    for (unsigned int d = 0; d < 64; ++d) { q[base+d] = qrow[d]; k[base+d] = krow[d]; }
+}
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -196,6 +240,7 @@ pub struct CudaRuntime {
     layernorm: CudaFunction,
     layernorm_cpu_order: CudaFunction,
     attention_online: CudaFunction,
+    qk_norm_rope: CudaFunction,
     blas: Arc<CudaBlas>,
 }
 
@@ -230,6 +275,9 @@ impl CudaRuntime {
         let attention_online = module
             .load_function("vestra_attention_online_f32")
             .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
+        let qk_norm_rope = module
+            .load_function("vestra_qk_norm_rope_f32")
+            .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
         let blas = Arc::new(
             CudaBlas::new(stream.clone())
                 .map_err(|error| CudaError::Blas(format!("handle initialization: {error:?}")))?,
@@ -245,6 +293,7 @@ impl CudaRuntime {
             layernorm,
             layernorm_cpu_order,
             attention_online,
+            qk_norm_rope,
             blas,
         })
     }
@@ -570,6 +619,61 @@ impl CudaRuntime {
             data: output,
             len: expected,
         })
+    }
+
+    /// Fused CPU-order Q/K LayerNorm and 2D RoPE for DA3-BASE's fixed 64-wide
+    /// head rows. `positions_yx` is device-resident `[tokens, 2]` F32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope_f32_da3_base(
+        &self,
+        q: &mut CudaTensorF32,
+        k: &mut CudaTensorF32,
+        q_gamma: &CudaTensorF32,
+        q_beta: &CudaTensorF32,
+        k_gamma: &CudaTensorF32,
+        k_beta: &CudaTensorF32,
+        positions_yx: &CudaTensorF32,
+        heads: usize,
+        tokens: usize,
+        frequency: f32,
+        epsilon: f32,
+    ) -> Result<(), CudaError> {
+        let expected = heads.saturating_mul(tokens).saturating_mul(64);
+        if q.len != expected
+            || k.len != expected
+            || q_gamma.len != 64
+            || q_beta.len != 64
+            || k_gamma.len != 64
+            || k_beta.len != 64
+            || positions_yx.len != tokens.saturating_mul(2)
+        {
+            return Err(CudaError::LengthMismatch {
+                destination: q.len,
+                source_len: expected,
+            });
+        }
+        let tokens = u32::try_from(tokens)
+            .map_err(|_| CudaError::Kernel("token count exceeds CUDA u32 indexing".into()))?;
+        let rows = u32::try_from(heads.saturating_mul(tokens as usize))
+            .map_err(|_| CudaError::Kernel("Q/K rows exceed CUDA u32 indexing".into()))?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.qk_norm_rope)
+                .arg(&mut q.data)
+                .arg(&mut k.data)
+                .arg(&q_gamma.data)
+                .arg(&q_beta.data)
+                .arg(&k_gamma.data)
+                .arg(&k_beta.data)
+                .arg(&positions_yx.data)
+                .arg(&tokens)
+                .arg(&frequency)
+                .arg(&epsilon)
+                .arg(&rows)
+                .launch(LaunchConfig::for_num_elems(rows))
+                .map_err(|error| CudaError::Kernel(format!("Q/K norm+RoPE launch: {error:?}")))?;
+        }
+        Ok(())
     }
 
     /// Uploads immutable row-major linear parameters once. The returned plan
