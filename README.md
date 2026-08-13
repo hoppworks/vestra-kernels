@@ -4,7 +4,7 @@ Vestra Kernels is the independently benchmarked low-level compute layer for
 Vestra Engine. It owns fixed-shape CPU and CUDA kernels; model semantics,
 scheduling, preprocessing, and reconstruction remain outside this repository.
 
-## Current production paths
+## Scope
 
 - AVX-512 projection and attention kernels for the DA3-BASE 504×336 workload
 - Optional BLIS bridges for qualified linear shapes
@@ -12,7 +12,8 @@ scheduling, preprocessing, and reconstruction remain outside this repository.
 - Fused high-resolution resize and output convolution support
 
 CUDA is part of the Vestra architecture but is not implemented in this initial
-repository snapshot.
+repository snapshot. The public surface accepts explicit primitive buffers and
+dimensions; it deliberately does not import model, GGUF, CLI, or engine types.
 
 ## Qualification gate
 
@@ -32,7 +33,11 @@ threads at 504×336.
 
 ```bash
 cargo test --lib
+cargo test --tests
 ```
 
 AVX-512 tests require compatible x86-64 hardware. Local unit tests alone are
 not sufficient evidence for a performance claim.
+
+See [API.md](API.md) for the stable boundary and
+[BENCHMARKING.md](BENCHMARKING.md) for the qualification protocol.
