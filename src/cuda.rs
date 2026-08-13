@@ -31,6 +31,18 @@ extern "C" __global__ void vestra_copy_f32(float* destination, const float* sour
     if (index < len) destination[index] = source[index];
 }
 
+// Device-resident tensor segment move. DA3 multi-view alternates individual
+// view buffers with one flattened global-attention buffer; this primitive
+// performs that layout scheduling without staging activations on the host.
+extern "C" __global__ void vestra_copy_segment_f32(
+    float* destination, const float* source,
+    unsigned int destination_offset, unsigned int source_offset,
+    unsigned int len
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < len) destination[destination_offset + index] = source[source_offset + index];
+}
+
 // Replaces the leading token row from a cached camera-token parameter. DA3
 // injects this at alt_start; the prefix form is intentionally general enough
 // to remain useful for future register-token handling.
@@ -350,6 +362,7 @@ pub struct CudaRuntime {
     _module: Arc<CudaModule>,
     residual_add: CudaFunction,
     copy: CudaFunction,
+    copy_segment: CudaFunction,
     overwrite_prefix: CudaFunction,
     bias_scale: CudaFunction,
     gelu: CudaFunction,
@@ -383,6 +396,9 @@ impl CudaRuntime {
             .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
         let copy = module
             .load_function("vestra_copy_f32")
+            .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
+        let copy_segment = module
+            .load_function("vestra_copy_segment_f32")
             .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
         let overwrite_prefix = module
             .load_function("vestra_overwrite_prefix_f32")
@@ -431,6 +447,7 @@ impl CudaRuntime {
             _module: module,
             residual_add,
             copy,
+            copy_segment,
             overwrite_prefix,
             bias_scale,
             gelu,
@@ -496,6 +513,85 @@ impl CudaRuntime {
             data: destination,
             len: source.len,
         })
+    }
+
+    /// Allocates a device tensor and copies a contiguous range from `source`.
+    pub fn copy_segment_f32(
+        &self,
+        source: &CudaTensorF32,
+        source_offset: usize,
+        len: usize,
+    ) -> Result<CudaTensorF32, CudaError> {
+        if source_offset.saturating_add(len) > source.len {
+            return Err(CudaError::LengthMismatch {
+                destination: len,
+                source_len: source.len.saturating_sub(source_offset),
+            });
+        }
+        let mut destination = self
+            .stream
+            .clone_htod(&vec![0.0_f32; len])
+            .map_err(|error| CudaError::Upload(format!("segment allocation: {error:?}")))?;
+        self.copy_segment_into_raw(&mut destination, 0, &source.data, source_offset, len)?;
+        Ok(CudaTensorF32 {
+            data: destination,
+            len,
+        })
+    }
+
+    /// Copies a contiguous device range into a preallocated device tensor.
+    pub fn copy_segment_into_f32(
+        &self,
+        destination: &mut CudaTensorF32,
+        destination_offset: usize,
+        source: &CudaTensorF32,
+        source_offset: usize,
+        len: usize,
+    ) -> Result<(), CudaError> {
+        if destination_offset.saturating_add(len) > destination.len
+            || source_offset.saturating_add(len) > source.len
+        {
+            return Err(CudaError::LengthMismatch {
+                destination: destination.len.saturating_sub(destination_offset),
+                source_len: source.len.saturating_sub(source_offset),
+            });
+        }
+        self.copy_segment_into_raw(
+            &mut destination.data,
+            destination_offset,
+            &source.data,
+            source_offset,
+            len,
+        )
+    }
+
+    fn copy_segment_into_raw(
+        &self,
+        destination: &mut CudaSlice<f32>,
+        destination_offset: usize,
+        source: &CudaSlice<f32>,
+        source_offset: usize,
+        len: usize,
+    ) -> Result<(), CudaError> {
+        let destination_offset = u32::try_from(destination_offset).map_err(|_| {
+            CudaError::Kernel("destination offset exceeds CUDA u32 indexing".into())
+        })?;
+        let source_offset = u32::try_from(source_offset)
+            .map_err(|_| CudaError::Kernel("source offset exceeds CUDA u32 indexing".into()))?;
+        let count = u32::try_from(len)
+            .map_err(|_| CudaError::Kernel("segment length exceeds CUDA u32 indexing".into()))?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.copy_segment)
+                .arg(destination)
+                .arg(source)
+                .arg(&destination_offset)
+                .arg(&source_offset)
+                .arg(&count)
+                .launch(LaunchConfig::for_num_elems(count))
+                .map_err(|error| CudaError::Kernel(format!("segment copy launch: {error:?}")))?;
+        }
+        Ok(())
     }
 
     /// Replaces a device tensor's leading contiguous values from a cached
@@ -1288,7 +1384,19 @@ mod tests {
         runtime
             .overwrite_prefix_f32(&mut copied, &replacement, 2)
             .unwrap();
-        assert_eq!(runtime.download_f32(&copied).unwrap(), [-1.0, -2.0, 7.0, 6.0]);
+        assert_eq!(
+            runtime.download_f32(&copied).unwrap(),
+            [-1.0, -2.0, 7.0, 6.0]
+        );
+        let segment = runtime.copy_segment_f32(&source, 1, 2).unwrap();
+        assert_eq!(runtime.download_f32(&segment).unwrap(), [8.0, 7.0]);
+        runtime
+            .copy_segment_into_f32(&mut copied, 2, &segment, 0, 2)
+            .unwrap();
+        assert_eq!(
+            runtime.download_f32(&copied).unwrap(),
+            [-1.0, -2.0, 8.0, 7.0]
+        );
 
         let left = runtime.upload_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let right = runtime
