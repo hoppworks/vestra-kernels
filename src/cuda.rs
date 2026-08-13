@@ -244,6 +244,21 @@ extern "C" __global__ void vestra_hnd_to_token_f32(
         + token * head_dim + (within % head_dim);
     token_major[index] = hnd[source];
 }
+
+// Transposes token-major `[tokens, channels]` to CHW `[channels, height,
+// width]`; tokens are row-major over the spatial grid. This is the device
+// layout needed by the DPT resize and convolution stages after a 1x1 GEMM.
+extern "C" __global__ void vestra_token_to_chw_f32(
+    const float* token_major, float* chw,
+    unsigned int tokens, unsigned int channels
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int len = tokens * channels;
+    if (index >= len) return;
+    const unsigned int token = index / channels;
+    const unsigned int channel = index % channels;
+    chw[channel * tokens + token] = token_major[index];
+}
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -281,6 +296,7 @@ pub struct CudaRuntime {
     qk_norm_rope: CudaFunction,
     split_qkv_hnd: CudaFunction,
     hnd_to_token: CudaFunction,
+    token_to_chw: CudaFunction,
     blas: Arc<CudaBlas>,
 }
 
@@ -324,6 +340,9 @@ impl CudaRuntime {
         let hnd_to_token = module
             .load_function("vestra_hnd_to_token_f32")
             .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
+        let token_to_chw = module
+            .load_function("vestra_token_to_chw_f32")
+            .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
         let blas = Arc::new(
             CudaBlas::new(stream.clone())
                 .map_err(|error| CudaError::Blas(format!("handle initialization: {error:?}")))?,
@@ -342,6 +361,7 @@ impl CudaRuntime {
             qk_norm_rope,
             split_qkv_hnd,
             hnd_to_token,
+            token_to_chw,
             blas,
         })
     }
@@ -775,6 +795,46 @@ impl CudaRuntime {
         Ok(CudaTensorF32 { data: output, len })
     }
 
+    /// Converts token-major `[tokens, channels]` F32 to CHW, keeping the
+    /// tensor device-resident for DPT convolution and resize operators.
+    pub fn token_to_chw_f32(
+        &self,
+        token_major: &CudaTensorF32,
+        tokens: usize,
+        channels: usize,
+    ) -> Result<CudaTensorF32, CudaError> {
+        let len = tokens.saturating_mul(channels);
+        if token_major.len != len || tokens == 0 || channels == 0 {
+            return Err(CudaError::LengthMismatch {
+                destination: token_major.len,
+                source_len: len,
+            });
+        }
+        let count = u32::try_from(len)
+            .map_err(|_| CudaError::Kernel("DPT layout length exceeds CUDA u32 indexing".into()))?;
+        let tokens = u32::try_from(tokens)
+            .map_err(|_| CudaError::Kernel("DPT token count exceeds CUDA u32 indexing".into()))?;
+        let channels = u32::try_from(channels)
+            .map_err(|_| CudaError::Kernel("DPT channel count exceeds CUDA u32 indexing".into()))?;
+        let mut output = self
+            .stream
+            .clone_htod(&vec![0.0_f32; len])
+            .map_err(|error| CudaError::Upload(format!("DPT CHW allocation: {error:?}")))?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.token_to_chw)
+                .arg(&token_major.data)
+                .arg(&mut output)
+                .arg(&tokens)
+                .arg(&channels)
+                .launch(LaunchConfig::for_num_elems(count))
+                .map_err(|error| {
+                    CudaError::Kernel(format!("DPT token-to-CHW launch: {error:?}"))
+                })?;
+        }
+        Ok(CudaTensorF32 { data: output, len })
+    }
+
     /// Fused CPU-order Q/K LayerNorm and 2D RoPE for DA3-BASE's fixed 64-wide
     /// head rows. `positions_yx` is device-resident `[tokens, 2]` F32.
     #[allow(clippy::too_many_arguments)]
@@ -1132,6 +1192,18 @@ mod tests {
             runtime.download_f32(&unpacked).unwrap(),
             expected_token_major
         );
+
+        let chw = runtime
+            .token_to_chw_f32(&unpacked, layout_tokens, embed)
+            .unwrap();
+        let mut expected_chw = vec![0.0; layout_tokens * embed];
+        for token in 0..layout_tokens {
+            for channel in 0..embed {
+                expected_chw[channel * layout_tokens + token] =
+                    expected_token_major[token * embed + channel];
+            }
+        }
+        assert_eq!(runtime.download_f32(&chw).unwrap(), expected_chw);
     }
 
     /// Actual DA3-BASE attention geometry. This is separately gated because
