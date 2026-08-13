@@ -7,7 +7,21 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
+use cudarc::{
+    driver::{
+        CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    },
+    nvrtc::compile_ptx,
+};
+
+const RESIDUAL_ADD_SOURCE: &str = r#"
+extern "C" __global__ void vestra_add_f32(float* destination, const float* source, unsigned int len) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < len) {
+        destination[index] += source[index];
+    }
+}
+"#;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CudaError {
@@ -17,6 +31,13 @@ pub enum CudaError {
     Upload(String),
     #[error("CUDA device-to-host transfer failed: {0}")]
     Download(String),
+    #[error("CUDA residual add requires equally sized tensors, got {destination} and {source_len}")]
+    LengthMismatch {
+        destination: usize,
+        source_len: usize,
+    },
+    #[error("CUDA kernel compilation or launch failed: {0}")]
+    Kernel(String),
 }
 
 /// A single Engine-owned CUDA device and its default ordered stream.
@@ -25,6 +46,8 @@ pub struct CudaRuntime {
     device: usize,
     context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
+    _module: Arc<CudaModule>,
+    residual_add: CudaFunction,
 }
 
 impl CudaRuntime {
@@ -35,10 +58,20 @@ impl CudaRuntime {
             detail: format!("{error:?}"),
         })?;
         let stream = context.default_stream();
+        let ptx = compile_ptx(RESIDUAL_ADD_SOURCE)
+            .map_err(|error| CudaError::Kernel(format!("NVRTC compile: {error:?}")))?;
+        let module = context
+            .load_module(ptx)
+            .map_err(|error| CudaError::Kernel(format!("PTX load: {error:?}")))?;
+        let residual_add = module
+            .load_function("vestra_add_f32")
+            .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
         Ok(Self {
             device,
             context,
             stream,
+            _module: module,
+            residual_add,
         })
     }
 
@@ -66,6 +99,36 @@ impl CudaRuntime {
         self.stream
             .clone_dtoh(&tensor.data)
             .map_err(|error| CudaError::Download(format!("{error:?}")))
+    }
+
+    /// Adds `source` into `destination` on the device. This is the first
+    /// parity-testable building block for DA3 residual and LayerScale paths;
+    /// callers retain tensors on device across chained operators.
+    pub fn add_f32_in_place(
+        &self,
+        destination: &mut CudaTensorF32,
+        source: &CudaTensorF32,
+    ) -> Result<(), CudaError> {
+        if destination.len != source.len {
+            return Err(CudaError::LengthMismatch {
+                destination: destination.len,
+                source_len: source.len,
+            });
+        }
+        let count = u32::try_from(destination.len)
+            .map_err(|_| CudaError::Kernel("tensor length exceeds CUDA u32 indexing".into()))?;
+        // The CUDA source bounds-checks every launched index and the safe
+        // driver builder tracks read/write dependencies for both allocations.
+        unsafe {
+            self.stream
+                .launch_builder(&self.residual_add)
+                .arg(&mut destination.data)
+                .arg(&source.data)
+                .arg(&count)
+                .launch(LaunchConfig::for_num_elems(count))
+                .map_err(|error| CudaError::Kernel(format!("residual add launch: {error:?}")))?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -108,8 +171,10 @@ mod tests {
             return;
         }
         let runtime = CudaRuntime::new(0).unwrap();
-        let tensor = runtime.upload_f32(&[1.0, -2.0, 3.5]).unwrap();
+        let mut tensor = runtime.upload_f32(&[1.0, -2.0, 3.5]).unwrap();
+        let addend = runtime.upload_f32(&[0.5, 2.0, -1.0]).unwrap();
         assert_eq!(tensor.len(), 3);
-        assert_eq!(runtime.download_f32(&tensor).unwrap(), [1.0, -2.0, 3.5]);
+        runtime.add_f32_in_place(&mut tensor, &addend).unwrap();
+        assert_eq!(runtime.download_f32(&tensor).unwrap(), [1.5, 0.0, 2.5]);
     }
 }
