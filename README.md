@@ -1,26 +1,57 @@
 # da3-kernels
 
-Small, independently versioned CPU kernels for Depth Anything 3.
+`da3-kernels` is the narrow CPU-kernel companion to the Rust DA3-BASE engine.
+It owns only fixed-shape kernels whose numerical behaviour and whole-model
+benefit were measured on the target workload. The engine owns DA3 semantics,
+model loading, scheduling and parity orchestration; this repository owns the
+specialized CPU inner loops.
 
-The repository deliberately owns only kernels with a measurable DA3 benefit.
-Every candidate must be compared against the existing Rust fallback using the
-same F32 model, input, resolution and thread budget. Integration into
-`depth-anything-rs` happens only after the four-image F32 parity contract and
-the locked Workhorse benchmark pass.
+## Contract
 
-Initial target: AVX-512 F32 matrix multiplication for the four repeated
-DA3-BASE transformer projection shapes at 504×336. No kernel is enabled yet.
+A kernel is eligible for the production path only when all of these hold:
 
-## Experiment log
+1. it executes the same DA3-BASE F32 work at 504×336;
+2. it has an isolated correctness oracle;
+3. it wins a same-binary, alternating benchmark on the Ryzen 9 workhorse;
+4. the engine passes the four-image C++-F32 fidelity gate; and
+5. the randomized ten-trial end-to-end study confirms the gain.
 
-| Candidate | Workhorse A/B result | Decision |
-|---|---:|---|
-| 4×96 output-channel projection microkernel | 337.251 ms vs Faer 326.949 ms | Rejected; it reread weight tiles per token group. |
-| 4-query × 64-key F32 flash-attention prototype | 378.414 ms end-to-end smoke | Rejected from the main runtime; it still spends too much time in scalar exponentiation and temporary accumulation. |
-| 64-query × 64-key packed revision | 376.761 ms end-to-end smoke | Rejected; higher tile reuse did not beat the established per-query path. |
-| GGML-style 4×64 small GEMMs + packed Flash tiles | 299.535 ms vs 325.157 ms fallback (same binary, 1 warm-up + median of 5) | Accepted into `depth-anything-rs` after four-image F32 parity. |
-| 4×64 AVX-512 DA3 projection candidate | parity PASS; A/B smoke remains noise-sensitive | Enabled behind `DA3_KERNELS_DISABLE_LINEAR` while further trials accumulate. |
+No quantized result, changed resize policy, altered thread budget or best
+single sample is a direct F32 performance claim.
 
-The accepted Flash kernel is an explicit local dependency of the production
-runtime. Future variants remain measurement-only until they beat it in an
-isolated A/B and pass the full F32 parity gate.
+## Current accepted paths
+
+- Fixed DA3 projection shapes use native AVX-512 kernels and, in the explicit
+  workhorse build, selected BLIS SGEMM bridges.
+- Prepared F(2,3×3) Winograd kernels serve the DPT head. The engine fuses the
+  final resize with the output convolution.
+- Flash attention uses an AVX-512 eight-query × two-32-output-panel kernel.
+  Complete eight-query tiles use a dedicated persistent-K variant; it is
+  bit-identical to the generic QT8 path while avoiding diagnostic fallback
+  scratch.
+
+The qualified DA3 CPU-F32 study with these paths measured Rust at 165.751 ms
+and C++/ggml at 238.647 ms on the Ryzen 9 9950X, 16 threads. That is 1.44×
+throughput, or 44.0% faster Rust execution. Full protocol, raw trials, parity
+results and the decision ledger live with the engine repository in its
+CPU-F32 status guide.
+
+## Development rules
+
+- Keep every candidate opt-in until the full gate passes.
+- Preserve F32 operation order unless the end-to-end parity gate explicitly
+  validates the change.
+- Keep an old path available only when it is useful as a controlled A/B arm;
+  remove rejected experiments rather than accumulating runtime switches.
+- Do not claim a generic Rust or AVX-512 advantage from these locked-shape
+  measurements.
+
+## Validation
+
+```bash
+cargo test --lib
+```
+
+The AVX-512-specific tests run on supported x86-64 hardware. A qualifying
+change additionally requires the target-hardware oracle and the engine-level
+benchmark protocol; local unit tests alone are not enough.
