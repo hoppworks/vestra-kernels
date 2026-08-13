@@ -975,4 +975,89 @@ mod tests {
         assert!(mae <= 5e-5, "DA3 attention MAE {mae} exceeds 5e-5");
         assert!(max <= 5e-4, "DA3 attention max error {max} exceeds 5e-4");
     }
+
+    #[test]
+    fn cuda_qk_norm_rope_matches_production_da3_base_shape() {
+        if std::env::var_os("VESTRA_CUDA_DA3_QK_ROPE_TEST").is_none() {
+            return;
+        }
+        const HEADS: usize = 12;
+        const TOKENS: usize = 865;
+        const DIM: usize = 64;
+        let len = HEADS * TOKENS * DIM;
+        let source = deterministic_values(len, 0.21);
+        let mut expected_q = source.clone();
+        let mut expected_k = deterministic_values(len, -0.37);
+        let q_gamma = deterministic_values(DIM, 0.11);
+        let q_beta = deterministic_values(DIM, -0.15);
+        let k_gamma = deterministic_values(DIM, 0.31);
+        let k_beta = deterministic_values(DIM, -0.23);
+        let positions_i64 = (0..TOKENS)
+            .flat_map(|token| {
+                if token == 0 {
+                    [0_i64, 0]
+                } else {
+                    [((token - 1) / 36 + 1) as i64, ((token - 1) % 36 + 1) as i64]
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(crate::qk_norm_rope_f32_da3_base(
+            &mut expected_q,
+            &mut expected_k,
+            &q_gamma,
+            &q_beta,
+            &k_gamma,
+            &k_beta,
+            &positions_i64,
+            100.0,
+            1e-5,
+        ));
+
+        let positions_f32 = positions_i64
+            .iter()
+            .map(|value| *value as f32)
+            .collect::<Vec<_>>();
+        let runtime = CudaRuntime::new(0).unwrap();
+        let mut q = runtime.upload_f32(&source).unwrap();
+        let mut k = runtime
+            .upload_f32(&deterministic_values(len, -0.37))
+            .unwrap();
+        let q_gamma_d = runtime.upload_f32(&q_gamma).unwrap();
+        let q_beta_d = runtime.upload_f32(&q_beta).unwrap();
+        let k_gamma_d = runtime.upload_f32(&k_gamma).unwrap();
+        let k_beta_d = runtime.upload_f32(&k_beta).unwrap();
+        let positions = runtime.upload_f32(&positions_f32).unwrap();
+        runtime
+            .qk_norm_rope_f32_da3_base(
+                &mut q, &mut k, &q_gamma_d, &q_beta_d, &k_gamma_d, &k_beta_d, &positions, HEADS,
+                TOKENS, 100.0, 1e-5,
+            )
+            .unwrap();
+        let actual_q = runtime.download_f32(&q).unwrap();
+        let actual_k = runtime.download_f32(&k).unwrap();
+        let error = |expected: &[f32], actual: &[f32]| {
+            let mae = expected
+                .iter()
+                .zip(actual)
+                .map(|(a, b)| (a - b).abs())
+                .sum::<f32>()
+                / expected.len() as f32;
+            let max = expected
+                .iter()
+                .zip(actual)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            (mae, max)
+        };
+        let (q_mae, q_max) = error(&expected_q, &actual_q);
+        let (k_mae, k_max) = error(&expected_k, &actual_k);
+        assert!(
+            q_mae <= 5e-5 && q_max <= 5e-4,
+            "Q mismatch: MAE={q_mae}, max={q_max}"
+        );
+        assert!(
+            k_mae <= 5e-5 && k_max <= 5e-4,
+            "K mismatch: MAE={k_mae}, max={k_max}"
+        );
+    }
 }
