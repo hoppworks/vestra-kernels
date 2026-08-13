@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use cudarc::{
+    cublas::{CudaBlas, Gemm as CublasGemm, GemmConfig, sys::cublasOperation_t},
     driver::{
         CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
     },
@@ -38,6 +39,8 @@ pub enum CudaError {
     },
     #[error("CUDA kernel compilation or launch failed: {0}")]
     Kernel(String),
+    #[error("CUDA CUBLAS operation failed: {0}")]
+    Blas(String),
 }
 
 /// A single Engine-owned CUDA device and its default ordered stream.
@@ -48,6 +51,7 @@ pub struct CudaRuntime {
     stream: Arc<CudaStream>,
     _module: Arc<CudaModule>,
     residual_add: CudaFunction,
+    blas: Arc<CudaBlas>,
 }
 
 impl CudaRuntime {
@@ -66,12 +70,17 @@ impl CudaRuntime {
         let residual_add = module
             .load_function("vestra_add_f32")
             .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
+        let blas = Arc::new(
+            CudaBlas::new(stream.clone())
+                .map_err(|error| CudaError::Blas(format!("handle initialization: {error:?}")))?,
+        );
         Ok(Self {
             device,
             context,
             stream,
             _module: module,
             residual_add,
+            blas,
         })
     }
 
@@ -131,6 +140,55 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Computes row-major `A[m,k] × B[k,n] -> C[m,n]` with F32 CUBLAS.
+    /// Inputs and output stay device-resident. CUBLAS is column-major, so
+    /// this uses the exact transposed identity `Cᵀ = Bᵀ × Aᵀ` without a host
+    /// layout conversion.
+    pub fn gemm_row_major_f32(
+        &self,
+        a: &CudaTensorF32,
+        b: &CudaTensorF32,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<CudaTensorF32, CudaError> {
+        if a.len != m.saturating_mul(k) || b.len != k.saturating_mul(n) {
+            return Err(CudaError::Blas(format!(
+                "row-major GEMM shape M={m}, K={k}, N={n} does not match A={} or B={}",
+                a.len, b.len
+            )));
+        }
+        let m_i32 = i32::try_from(m).map_err(|_| CudaError::Blas("M exceeds i32".into()))?;
+        let k_i32 = i32::try_from(k).map_err(|_| CudaError::Blas("K exceeds i32".into()))?;
+        let n_i32 = i32::try_from(n).map_err(|_| CudaError::Blas("N exceeds i32".into()))?;
+        let mut output = self
+            .stream
+            .clone_htod(&vec![0.0_f32; m.saturating_mul(n)])
+            .map_err(|error| CudaError::Upload(format!("GEMM output allocation: {error:?}")))?;
+        let config = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_N,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            // Column-major Cᵀ[N,M] = Bᵀ[N,K] × Aᵀ[K,M].
+            m: n_i32,
+            n: m_i32,
+            k: k_i32,
+            alpha: 1.0_f32,
+            lda: n_i32,
+            ldb: k_i32,
+            beta: 0.0_f32,
+            ldc: n_i32,
+        };
+        unsafe {
+            self.blas
+                .gemm(config, &b.data, &a.data, &mut output)
+                .map_err(|error| CudaError::Blas(format!("row-major GEMM: {error:?}")))?;
+        }
+        Ok(CudaTensorF32 {
+            data: output,
+            len: m * n,
+        })
+    }
+
     #[must_use]
     pub fn context(&self) -> &Arc<CudaContext> {
         &self.context
@@ -176,5 +234,15 @@ mod tests {
         assert_eq!(tensor.len(), 3);
         runtime.add_f32_in_place(&mut tensor, &addend).unwrap();
         assert_eq!(runtime.download_f32(&tensor).unwrap(), [1.5, 0.0, 2.5]);
+
+        let left = runtime.upload_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let right = runtime
+            .upload_f32(&[7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+            .unwrap();
+        let product = runtime.gemm_row_major_f32(&left, &right, 2, 3, 2).unwrap();
+        assert_eq!(
+            runtime.download_f32(&product).unwrap(),
+            [58.0, 64.0, 139.0, 154.0]
+        );
     }
 }
