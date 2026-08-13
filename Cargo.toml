@@ -7,9 +7,15 @@ description = "Specialized CPU and CUDA kernels for Vestra Engine"
 repository = "https://github.com/hoppworks/vestra-kernels"
 
 [dependencies]
+cudarc = { version = "0.19.9", default-features = false, features = ["driver", "dynamic-loading", "cuda-12000"], optional = true }
 faer = "0.19"
 half = "2"
 rayon = "1.10"
+thiserror = "2"
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
 
 [dev-dependencies]
 criterion = "0.5"
