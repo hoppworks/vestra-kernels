@@ -23,6 +23,24 @@ extern "C" __global__ void vestra_add_f32(float* destination, const float* sourc
     }
 }
 
+// Device-to-device copy used to retain the last local-token state across a
+// subsequent DA3 global-attention block. Keeping this explicit avoids a host
+// round trip merely to snapshot an activation.
+extern "C" __global__ void vestra_copy_f32(float* destination, const float* source, unsigned int len) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < len) destination[index] = source[index];
+}
+
+// Replaces the leading token row from a cached camera-token parameter. DA3
+// injects this at alt_start; the prefix form is intentionally general enough
+// to remain useful for future register-token handling.
+extern "C" __global__ void vestra_overwrite_prefix_f32(
+    float* destination, const float* source, unsigned int len
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < len) destination[index] = source[index];
+}
+
 extern "C" __global__ void vestra_bias_scale_f32(
     float* values,
     const float* bias,
@@ -331,6 +349,8 @@ pub struct CudaRuntime {
     stream: Arc<CudaStream>,
     _module: Arc<CudaModule>,
     residual_add: CudaFunction,
+    copy: CudaFunction,
+    overwrite_prefix: CudaFunction,
     bias_scale: CudaFunction,
     gelu: CudaFunction,
     layernorm: CudaFunction,
@@ -360,6 +380,12 @@ impl CudaRuntime {
             .map_err(|error| CudaError::Kernel(format!("PTX load: {error:?}")))?;
         let residual_add = module
             .load_function("vestra_add_f32")
+            .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
+        let copy = module
+            .load_function("vestra_copy_f32")
+            .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
+        let overwrite_prefix = module
+            .load_function("vestra_overwrite_prefix_f32")
             .map_err(|error| CudaError::Kernel(format!("function lookup: {error:?}")))?;
         let bias_scale = module
             .load_function("vestra_bias_scale_f32")
@@ -404,6 +430,8 @@ impl CudaRuntime {
             stream,
             _module: module,
             residual_add,
+            copy,
+            overwrite_prefix,
             bias_scale,
             gelu,
             layernorm,
@@ -443,6 +471,61 @@ impl CudaRuntime {
         self.stream
             .clone_dtoh(&tensor.data)
             .map_err(|error| CudaError::Download(format!("{error:?}")))
+    }
+
+    /// Makes a device-to-device F32 copy without exposing an activation to
+    /// host memory. This is used for DA3's `local_x` snapshot immediately
+    /// before a global attention layer.
+    pub fn copy_f32(&self, source: &CudaTensorF32) -> Result<CudaTensorF32, CudaError> {
+        let mut destination = self
+            .stream
+            .clone_htod(&vec![0.0_f32; source.len])
+            .map_err(|error| CudaError::Upload(format!("copy allocation: {error:?}")))?;
+        let count = u32::try_from(source.len)
+            .map_err(|_| CudaError::Kernel("tensor length exceeds CUDA u32 indexing".into()))?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.copy)
+                .arg(&mut destination)
+                .arg(&source.data)
+                .arg(&count)
+                .launch(LaunchConfig::for_num_elems(count))
+                .map_err(|error| CudaError::Kernel(format!("copy launch: {error:?}")))?;
+        }
+        Ok(CudaTensorF32 {
+            data: destination,
+            len: source.len,
+        })
+    }
+
+    /// Replaces a device tensor's leading contiguous values from a cached
+    /// device parameter. The operation is ordered on this runtime's stream.
+    pub fn overwrite_prefix_f32(
+        &self,
+        destination: &mut CudaTensorF32,
+        source: &CudaTensorF32,
+        len: usize,
+    ) -> Result<(), CudaError> {
+        if len > destination.len || len > source.len {
+            return Err(CudaError::LengthMismatch {
+                destination: destination.len,
+                source_len: source.len,
+            });
+        }
+        let count = u32::try_from(len)
+            .map_err(|_| CudaError::Kernel("prefix length exceeds CUDA u32 indexing".into()))?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.overwrite_prefix)
+                .arg(&mut destination.data)
+                .arg(&source.data)
+                .arg(&count)
+                .launch(LaunchConfig::for_num_elems(count))
+                .map_err(|error| {
+                    CudaError::Kernel(format!("overwrite prefix launch: {error:?}"))
+                })?;
+        }
+        Ok(())
     }
 
     /// Adds `source` into `destination` on the device. This is the first
@@ -1198,6 +1281,14 @@ mod tests {
         assert_eq!(tensor.len(), 3);
         runtime.add_f32_in_place(&mut tensor, &addend).unwrap();
         assert_eq!(runtime.download_f32(&tensor).unwrap(), [1.5, 0.0, 2.5]);
+
+        let source = runtime.upload_f32(&[9.0, 8.0, 7.0, 6.0]).unwrap();
+        let mut copied = runtime.copy_f32(&source).unwrap();
+        let replacement = runtime.upload_f32(&[-1.0, -2.0]).unwrap();
+        runtime
+            .overwrite_prefix_f32(&mut copied, &replacement, 2)
+            .unwrap();
+        assert_eq!(runtime.download_f32(&copied).unwrap(), [-1.0, -2.0, 7.0, 6.0]);
 
         let left = runtime.upload_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let right = runtime
