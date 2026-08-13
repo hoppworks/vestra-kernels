@@ -695,6 +695,12 @@ impl CudaTensorF32 {
 mod tests {
     use super::*;
 
+    fn deterministic_values(len: usize, seed: f32) -> Vec<f32> {
+        (0..len)
+            .map(|index| ((index as f32 * 0.017_578_125 + seed).sin() * 0.75) + 0.1)
+            .collect()
+    }
+
     #[test]
     fn driver_round_trip_preserves_f32_values_when_explicitly_enabled() {
         if std::env::var_os("VESTRA_CUDA_TEST").is_none() {
@@ -823,5 +829,46 @@ mod tests {
                 "online attention diverged: actual={actual}, expected={expected}"
             );
         }
+    }
+
+    /// Actual DA3-BASE attention geometry. This is separately gated because
+    /// it intentionally executes the full production-sized CPU reference as
+    /// well as the CUDA oracle; it is not a fast unit test.
+    #[test]
+    fn cuda_online_attention_matches_production_da3_base_shape() {
+        if std::env::var_os("VESTRA_CUDA_DA3_ATTENTION_TEST").is_none() {
+            return;
+        }
+        const HEADS: usize = 12;
+        const TOKENS: usize = 865;
+        const HEAD_DIM: usize = 64;
+        let len = HEADS * TOKENS * HEAD_DIM;
+        let q = deterministic_values(len, 0.1);
+        let k = deterministic_values(len, -0.3);
+        let v = deterministic_values(len, 0.7);
+        let mut expected = vec![0.0; len];
+        crate::attention::attention(&q, &k, &v, HEADS, TOKENS, HEAD_DIM, &mut expected);
+
+        let runtime = CudaRuntime::new(0).unwrap();
+        let q = runtime.upload_f32(&q).unwrap();
+        let k = runtime.upload_f32(&k).unwrap();
+        let v = runtime.upload_f32(&v).unwrap();
+        let actual = runtime
+            .attention_online_f32(&q, &k, &v, HEADS, TOKENS, HEAD_DIM)
+            .unwrap();
+        let actual = runtime.download_f32(&actual).unwrap();
+        let mae = expected
+            .iter()
+            .zip(&actual)
+            .map(|(left, right)| (left - right).abs())
+            .sum::<f32>()
+            / len as f32;
+        let max = expected
+            .iter()
+            .zip(&actual)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(mae <= 5e-5, "DA3 attention MAE {mae} exceeds 5e-5");
+        assert!(max <= 5e-4, "DA3 attention max error {max} exceeds 5e-4");
     }
 }
