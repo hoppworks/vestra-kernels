@@ -705,9 +705,15 @@ fn fc2_rows() -> usize {
     fc2_rows_from_env(std::env::var("DA3_KERNELS_FC2_ROWS").ok().as_deref())
 }
 
-/// Fused F32 attention for DA3's `[heads, tokens, 64]` layout. The function
-/// returns `false` without changing `out` when the CPU or shape is unsupported
-/// so its caller can safely use its established fallback.
+/// Fused F32 attention for DA3-BASE's `[heads, tokens, 64]` layout.
+///
+/// The native one-view raster has 865 tokens. PR #2's global cross-view
+/// layers concatenate an integral number of those same rasters, so the exact
+/// AVX-512 flash kernel is also valid for `views * 865` tokens. Keeping this
+/// gate explicit prevents unrelated 64-wide attention workloads from entering
+/// a DA3-specific unsafe implementation. The function returns `false` without
+/// changing `out` when the CPU or shape is unsupported so its caller can
+/// safely use its established fallback.
 pub fn flash_attention_f32_da3_base(
     q: &[f32],
     k: &[f32],
@@ -719,7 +725,16 @@ pub fn flash_attention_f32_da3_base(
     if std::env::var_os("DA3_KERNELS_DISABLE_FLASH").is_some() {
         return false;
     }
-    if tokens != DA3_BASE_TOKENS_504X336
+    // Retain a narrowly scoped control for the multi-view A/B study. It must
+    // never affect one-view inference, whose established flash path remains
+    // independently benchmarked.
+    if tokens > DA3_BASE_TOKENS_504X336
+        && std::env::var_os("DA3_KERNELS_DISABLE_MULTIVIEW_FLASH").is_some()
+    {
+        return false;
+    }
+    if tokens == 0
+        || !tokens.is_multiple_of(DA3_BASE_TOKENS_504X336)
         || q.len() != heads * tokens * 64
         || k.len() != q.len()
         || v.len() != q.len()
@@ -3018,6 +3033,49 @@ mod tests {
                 .iter()
                 .zip(&specialized)
                 .all(|(generic, specialized)| generic.to_bits() == specialized.to_bits()),
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn flash_accepts_and_matches_a_two_view_da3_window() {
+        if !(std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma")) {
+            return;
+        }
+        const HEADS: usize = 1;
+        const TOKENS: usize = 2 * DA3_BASE_TOKENS_504X336;
+        const DIM: usize = 64;
+        let q: Vec<f32> = (0..HEADS * TOKENS * DIM)
+            .map(|index| (index as f32 * 0.013).sin())
+            .collect();
+        let k: Vec<f32> = (0..HEADS * TOKENS * DIM)
+            .map(|index| (index as f32 * 0.007).cos())
+            .collect();
+        let v: Vec<f32> = (0..HEADS * TOKENS * DIM)
+            .map(|index| (index as f32 * 0.017).sin())
+            .collect();
+        let mut fast = vec![0.0; q.len()];
+        let mut reference = vec![0.0; q.len()];
+
+        assert!(flash_attention_f32_da3_base(
+            &q, &k, &v, HEADS, TOKENS, &mut fast
+        ));
+        crate::attention::attention_serial(&q, &k, &v, HEADS, TOKENS, DIM, &mut reference);
+
+        let (mut mae, mut max_abs) = (0.0f64, 0.0f32);
+        for (candidate, control) in fast.iter().zip(&reference) {
+            let error = (candidate - control).abs();
+            mae += f64::from(error);
+            max_abs = max_abs.max(error);
+        }
+        mae /= fast.len() as f64;
+        assert!(
+            mae <= 2.0e-5,
+            "MAE {mae} exceeds the F32 attention envelope"
+        );
+        assert!(
+            max_abs <= 2.0e-4,
+            "max error {max_abs} exceeds the F32 attention envelope"
         );
     }
 
