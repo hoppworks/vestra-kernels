@@ -5,6 +5,10 @@
 //! (`quantize_row_q8_0`), then the block-dot against q8_0-quantized weights
 //! is accumulated in int32 and scaled by `d_a * d_b` per block.
 //!
+//! Upstream provenance: the Q8_0 arithmetic and SIMD layout were adapted from
+//! ggml commit `eced84c86f8b012c752c016f7fe789adea168e1e`. The retained MIT
+//! license and copyright notice are in `THIRD_PARTY_NOTICES.md`.
+//!
 //! `scalar::gemm_q8_0` (in `crate::scalar`) is the oracle used directly on
 //! non-x86_64 hosts via `Kernels::gemm_q8_0`. The AVX-512/VNNI path
 //! (`simd_avx512::gemm_q8_0_avx512`) must match that reference under the

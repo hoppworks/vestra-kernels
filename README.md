@@ -44,10 +44,10 @@ threads at 504×336.
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo clippy --lib --tests --features cuda -- -D warnings
-cargo test --all-targets
-cargo test --lib --tests --features cuda
+cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --lib --tests --features cuda -- -D warnings
+cargo test --locked --all-targets
+cargo test --locked --lib --tests --features cuda
 ```
 
 The repository pins Rust 1.93.0 with rustfmt and Clippy, and CI runs the same
@@ -62,3 +62,5 @@ installation and is enabled explicitly with `--features blis-experiment`.
 
 See [API.md](API.md) for the stable boundary and
 [BENCHMARKING.md](BENCHMARKING.md) for the qualification protocol.
+Upstream source and license attribution is retained in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

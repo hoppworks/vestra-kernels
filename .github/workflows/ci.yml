@@ -19,7 +19,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Show pinned toolchain
         run: rustc --version --verbose
@@ -28,13 +30,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Lint default targets
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Lint optional CUDA module
-        run: cargo clippy --lib --tests --features cuda -- -D warnings
+        run: cargo clippy --locked --lib --tests --features cuda -- -D warnings
 
       - name: Test default targets
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
 
       - name: Test optional CUDA module
-        run: cargo test --lib --tests --features cuda
+        run: cargo test --locked --lib --tests --features cuda

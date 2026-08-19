@@ -1,7 +1,7 @@
 //! Standalone BLIS feasibility test for the exact DA3-BASE linear shapes.
 //!
 //! Build only on a host that supplies an OpenMP BLIS library, for example:
-//! `RUSTFLAGS='-L native=/path/to/lib' cargo run --release --example blis_shape_bench`.
+//! `RUSTFLAGS='-L native=/path/to/lib' cargo run --locked --release --example blis_shape_bench`.
 //! This is deliberately not runtime wiring: it answers whether a different
 //! Zen-tuned GEMM backend can clear the required microbenchmark threshold.
 
