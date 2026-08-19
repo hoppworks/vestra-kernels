@@ -16,6 +16,7 @@ thiserror = "2"
 [features]
 default = []
 cuda = ["dep:cudarc"]
+blis-experiment = []
 
 [dev-dependencies]
 criterion = "0.5"
@@ -23,6 +24,10 @@ criterion = "0.5"
 [[bench]]
 name = "gemm_bench"
 harness = false
+
+[[example]]
+name = "blis_shape_bench"
+required-features = ["blis-experiment"]
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

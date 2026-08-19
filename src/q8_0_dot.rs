@@ -5,11 +5,10 @@
 //! (`quantize_row_q8_0`), then the block-dot against q8_0-quantized weights
 //! is accumulated in int32 and scaled by `d_a * d_b` per block.
 //!
-//! `scalar::gemm_q8_0` (in `crate::scalar`) is the oracle: it is exercised
-//! directly on non-x86_64 hosts (this development machine included, see
-//! `docs/optimization-log.md`) via `Kernels::gemm_q8_0`, and is the
-//! reference the AVX-512/VNNI path (`simd_avx512::gemm_q8_0_avx512`) must
-//! match on real x86-64 hardware.
+//! `scalar::gemm_q8_0` (in `crate::scalar`) is the oracle used directly on
+//! non-x86_64 hosts via `Kernels::gemm_q8_0`. The AVX-512/VNNI path
+//! (`simd_avx512::gemm_q8_0_avx512`) must match that reference under the
+//! qualification protocol in `BENCHMARKING.md`.
 
 use crate::{BlockQ8_0, QK8_0};
 

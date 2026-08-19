@@ -3,12 +3,26 @@
 //! A kernel is admitted only after it is faster than the caller's fallback on
 //! the target shape and passes the caller's end-to-end F32 parity gate.
 
+#![allow(
+    clippy::needless_range_loop,
+    reason = "fixed-index SIMD loops preserve the benchmarked accumulation order and LLVM shape"
+)]
+#![allow(
+    clippy::too_many_arguments,
+    reason = "kernel boundaries keep tensor dimensions and buffers explicit to prevent layout ambiguity"
+)]
+#![allow(
+    clippy::approx_constant,
+    clippy::excessive_precision,
+    reason = "established SIMD polynomial coefficients are retained verbatim for numerical parity"
+)]
+
 #[cfg(da3_blis)]
 use std::sync::Once;
-use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicU64, Ordering},
-};
+#[cfg(target_arch = "x86_64")]
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+#[cfg(target_arch = "x86_64")]
 use std::time::Instant;
 
 /// The DA3-BASE token count for a 504×336 input (36×24 patches plus special
@@ -119,7 +133,10 @@ mod blis_tests {
 /// runtime path free of a repeated weight-layout conversion.
 #[derive(Clone)]
 pub struct NonoverlapTransposeF32 {
-    packed: Arc<[f32]>,
+    // The backing storage is consumed only by the x86-64 implementation, but
+    // every target retains ownership so prepared filters have one layout and
+    // lifetime contract across all ISA fallbacks.
+    _packed: Arc<[f32]>,
     input_channels: usize,
     output_channels: usize,
     kernel_h: usize,
@@ -152,7 +169,7 @@ pub fn prepare_nonoverlap_transpose_f32(
         }
     }
     NonoverlapTransposeF32 {
-        packed: packed.into(),
+        _packed: packed.into(),
         input_channels,
         output_channels,
         kernel_h,
@@ -172,7 +189,7 @@ pub fn nonoverlap_transpose_f32(
     out: &mut [f32],
 ) -> bool {
     if std::env::var_os("DA3_KERNELS_DISABLE_TRANSPOSE").is_some()
-        || filter.input_channels % 16 != 0
+        || !filter.input_channels.is_multiple_of(16)
         || input.len() != filter.input_channels * input_h * input_w
         || bias.is_some_and(|values| values.len() != filter.output_channels)
         || out.len()
@@ -225,7 +242,7 @@ unsafe fn nonoverlap_transpose_avx512(
                         ..(iy * input_w + ix + 1) * input_channels];
                     for ky in 0..filter.kernel_h {
                         for kx in 0..filter.kernel_w {
-                            let weights = &filter.packed[((output_channel * filter.kernel_h + ky)
+                            let weights = &filter._packed[((output_channel * filter.kernel_h + ky)
                                 * filter.kernel_w
                                 + kx)
                                 * input_channels
@@ -452,7 +469,7 @@ pub fn winograd_f2_blocked_f32(
     if std::env::var_os("DA3_KERNELS_DISABLE_WINO").is_some()
         || tiles == 0
         || tiles > 8
-        || output_channels % 16 != 0
+        || !output_channels.is_multiple_of(16)
         || u.len() != 16 * input_channels * output_channels
         || v.len() != 16 * input_channels * tiles
         || m.len() != 16 * tiles * output_channels
@@ -488,7 +505,7 @@ pub fn winograd_f4_blocked_f32(
         || std::env::var_os("DA3_KERNELS_DISABLE_WINO_F4").is_some()
         || tiles == 0
         || tiles > 8
-        || output_channels % 16 != 0
+        || !output_channels.is_multiple_of(16)
         || u.len() != 36 * input_channels * output_channels
         || v.len() != 36 * input_channels * tiles
         || m.len() != 36 * tiles * output_channels
@@ -665,16 +682,9 @@ unsafe fn winograd_f2_blocked_avx512_tiles4(
     }
 }
 
-/// Transformer projection shapes eligible for a future specialised kernel.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Da3BaseProjection {
-    pub tokens: usize,
-    pub input_channels: usize,
-    pub output_channels: usize,
-}
-
 /// Selects the row micro-tile for the fixed projection kernels. Unsupported
 /// values deliberately retain the six-row production control.
+#[cfg(any(target_arch = "x86_64", test))]
 fn linear_rows_from_env(value: Option<&str>) -> usize {
     match value {
         Some("4") => 4,
@@ -683,6 +693,7 @@ fn linear_rows_from_env(value: Option<&str>) -> usize {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn linear_rows() -> usize {
     linear_rows_from_env(std::env::var("DA3_KERNELS_LINEAR_ROWS").ok().as_deref())
 }
@@ -693,6 +704,7 @@ fn linear_rows() -> usize {
 /// selector: FC2's 3072x768 weight matrix has a materially different cache
 /// footprint from FC1/QKV.  The production six-row kernel remains the
 /// default until a controlled end-to-end study accepts another value.
+#[cfg(any(target_arch = "x86_64", test))]
 fn fc2_rows_from_env(value: Option<&str>) -> usize {
     match value {
         Some("4") => 4,
@@ -701,6 +713,7 @@ fn fc2_rows_from_env(value: Option<&str>) -> usize {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn fc2_rows() -> usize {
     fc2_rows_from_env(std::env::var("DA3_KERNELS_FC2_ROWS").ok().as_deref())
 }
@@ -794,6 +807,7 @@ pub fn linear_f32_da3_base(
 
 /// The output-projection/FC2 form of the fixed DA3 kernel, with its two
 /// rowwise epilogue passes folded into the final stores.
+#[allow(clippy::too_many_arguments)]
 pub fn linear_bias_scale_f32_da3_base(
     m: usize,
     n: usize,
@@ -838,167 +852,6 @@ pub fn linear_bias_scale_f32_da3_base(
         return true;
     }
     false
-}
-
-/// DA3-BASE's FC1 projection with its bias and exact-erf GELU epilogue
-/// folded into the final store. This avoids two full activation-memory passes
-/// over the 865×3072 intermediate without changing the K-major FMA order.
-pub fn linear_bias_gelu_f32_da3_base(
-    m: usize,
-    n: usize,
-    k: usize,
-    a: &[f32],
-    b: &[f32],
-    bias: &[f32],
-    c: &mut [f32],
-) -> bool {
-    if std::env::var_os("DA3_KERNELS_DISABLE_FC1_EPILOGUE").is_some()
-        || m != DA3_BASE_TOKENS_504X336
-        || (k, n) != (768, 3072)
-        || a.len() != m * k
-        || b.len() != k * n
-        || bias.len() != n
-        || c.len() != m * n
-    {
-        return false;
-    }
-    #[cfg(target_arch = "x86_64")]
-    if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
-        unsafe { linear_bias_gelu_avx512(m, n, k, a, b, bias, c) };
-        return true;
-    }
-    false
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,fma")]
-unsafe fn linear_bias_gelu_avx512(
-    m: usize,
-    n: usize,
-    k: usize,
-    a: &[f32],
-    b: &[f32],
-    bias: &[f32],
-    c: &mut [f32],
-) {
-    use core::arch::x86_64::*;
-    use rayon::prelude::*;
-    const ROWS: usize = 6;
-    c.par_chunks_mut(ROWS * n)
-        .enumerate()
-        .for_each(|(tile, c_tile)| {
-            let row0 = tile * ROWS;
-            let rows = (m - row0).min(ROWS);
-            for col0 in (0..n).step_by(64) {
-                let mut acc = [[_mm512_setzero_ps(); 4]; ROWS];
-                for kk in 0..k {
-                    let bp = unsafe { b.as_ptr().add(kk * n + col0) };
-                    let bv = unsafe {
-                        [
-                            _mm512_loadu_ps(bp),
-                            _mm512_loadu_ps(bp.add(16)),
-                            _mm512_loadu_ps(bp.add(32)),
-                            _mm512_loadu_ps(bp.add(48)),
-                        ]
-                    };
-                    for row in 0..rows {
-                        let av = _mm512_set1_ps(a[(row0 + row) * k + kk]);
-                        for block in 0..4 {
-                            acc[row][block] = _mm512_fmadd_ps(av, bv[block], acc[row][block]);
-                        }
-                    }
-                }
-                for row in 0..rows {
-                    for block in 0..4 {
-                        let offset = col0 + block * 16;
-                        let bias_v = unsafe { _mm512_loadu_ps(bias.as_ptr().add(offset)) };
-                        let out = unsafe { gelu_avx512(_mm512_add_ps(acc[row][block], bias_v)) };
-                        unsafe { _mm512_storeu_ps(c_tile.as_mut_ptr().add(row * n + offset), out) };
-                    }
-                }
-            }
-        });
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,fma")]
-unsafe fn gelu_avx512(x: core::arch::x86_64::__m512) -> core::arch::x86_64::__m512 {
-    use core::arch::x86_64::*;
-    let one = _mm512_set1_ps(1.0);
-    let half = _mm512_set1_ps(0.5);
-    let inv_sqrt2 = _mm512_set1_ps(0.707_106_78);
-    let x = x;
-    let abs_mask = _mm512_set1_epi32(0x7fff_ffff);
-    let x_abs = _mm512_castsi512_ps(_mm512_and_epi32(
-        _mm512_castps_si512(_mm512_mul_ps(x, inv_sqrt2)),
-        abs_mask,
-    ));
-    let arg = _mm512_mul_ps(x, inv_sqrt2);
-    let neg_mask = _mm512_cmp_ps_mask(arg, _mm512_setzero_ps(), _CMP_LT_OQ);
-    let sign = _mm512_mask_blend_ps(neg_mask, one, _mm512_set1_ps(-1.0));
-    let t = _mm512_div_ps(
-        one,
-        _mm512_fmadd_ps(_mm512_set1_ps(0.327_591_1), x_abs, one),
-    );
-    let mut poly = _mm512_set1_ps(1.061_405_4);
-    poly = _mm512_fmadd_ps(poly, t, _mm512_set1_ps(-1.453_152_0));
-    poly = _mm512_fmadd_ps(poly, t, _mm512_set1_ps(1.421_413_7));
-    poly = _mm512_fmadd_ps(poly, t, _mm512_set1_ps(-0.284_496_74));
-    poly = _mm512_fmadd_ps(poly, t, _mm512_set1_ps(0.254_829_59));
-    poly = _mm512_mul_ps(poly, t);
-    let erf = _mm512_mul_ps(
-        sign,
-        _mm512_fnmadd_ps(
-            poly,
-            unsafe {
-                exp_avx512(_mm512_sub_ps(
-                    _mm512_setzero_ps(),
-                    _mm512_mul_ps(x_abs, x_abs),
-                ))
-            },
-            one,
-        ),
-    );
-    _mm512_mul_ps(_mm512_mul_ps(half, x), _mm512_add_ps(one, erf))
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,fma")]
-unsafe fn exp_avx512(x: core::arch::x86_64::__m512) -> core::arch::x86_64::__m512 {
-    use core::arch::x86_64::*;
-    let x = _mm512_max_ps(
-        _mm512_min_ps(x, _mm512_set1_ps(88.376_26)),
-        _mm512_set1_ps(-88.376_26),
-    );
-    let one = _mm512_set1_ps(1.0);
-    let fx0 = _mm512_fmadd_ps(x, _mm512_set1_ps(1.442_695_04), _mm512_set1_ps(0.5));
-    let fx_trunc = _mm512_cvtepi32_ps(_mm512_cvttps_epi32(fx0));
-    let fx = _mm512_mask_sub_ps(
-        fx_trunc,
-        _mm512_cmp_ps_mask(fx_trunc, fx0, _CMP_GT_OQ),
-        fx_trunc,
-        one,
-    );
-    let x = _mm512_fnmadd_ps(fx, _mm512_set1_ps(0.693_359_375), x);
-    let x = _mm512_fnmadd_ps(fx, _mm512_set1_ps(-2.121_944_4e-4), x);
-    let z = _mm512_mul_ps(x, x);
-    let mut y = _mm512_set1_ps(1.987_569_15e-4);
-    for coefficient in [
-        1.398_199_95e-3,
-        8.333_451_9e-3,
-        4.166_579_6e-2,
-        1.666_666_5e-1,
-        5.000_000_1e-1,
-    ] {
-        y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(coefficient));
-    }
-    y = _mm512_fmadd_ps(y, z, x);
-    let y = _mm512_add_ps(y, one);
-    let exponent = _mm512_slli_epi32(
-        _mm512_add_epi32(_mm512_cvttps_epi32(fx), _mm512_set1_epi32(0x7f)),
-        23,
-    );
-    _mm512_mul_ps(y, _mm512_castsi512_ps(exponent))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1449,6 +1302,7 @@ unsafe fn linear_avx512_column_split_rows<const ROWS: usize>(
 /// The same 4-query × 64-key streaming tile used by ggml's CPU flash path.
 /// K is packed once per tile into a dimension-major layout; a ZMM then scores
 /// sixteen keys at once. The online softmax keeps the memory footprint O(ND).
+#[cfg(any(target_arch = "x86_64", test))]
 #[inline]
 fn pack_key_head_dim_major(k_head: &[f32], tokens: usize, stride: usize) -> Vec<f32> {
     const D: usize = 64;
@@ -1463,8 +1317,10 @@ fn pack_key_head_dim_major(k_head: &[f32], tokens: usize, stride: usize) -> Vec<
     packed
 }
 
+#[cfg(any(target_arch = "x86_64", test))]
 const FLASH_QUERY_TILE: usize = 8;
 
+#[cfg(target_arch = "x86_64")]
 struct FlashProfile {
     enabled: bool,
     k_pack_ns: AtomicU64,
@@ -1473,6 +1329,7 @@ struct FlashProfile {
     v_gemm_ns: AtomicU64,
 }
 
+#[cfg(target_arch = "x86_64")]
 impl FlashProfile {
     fn from_env() -> Self {
         Self {
@@ -1500,6 +1357,7 @@ impl FlashProfile {
     }
 }
 
+#[cfg(any(target_arch = "x86_64", test))]
 fn flash_query_tile_from_env(value: Option<&str>) -> usize {
     match value {
         Some("4") => 4,
@@ -1513,6 +1371,7 @@ fn flash_query_tile_from_env(value: Option<&str>) -> usize {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn flash_query_tile() -> usize {
     flash_query_tile_from_env(
         std::env::var("DA3_KERNELS_FLASH_QUERY_TILE")
@@ -1521,14 +1380,17 @@ fn flash_query_tile() -> usize {
     )
 }
 
+#[cfg(any(target_arch = "x86_64", test))]
 fn flash_head_only_from_env(value: Option<&str>) -> bool {
     value.is_some()
 }
 
+#[cfg(any(target_arch = "x86_64", test))]
 fn flash_nested_super16_from_env(value: Option<&str>) -> bool {
     value.is_some()
 }
 
+#[cfg(test)]
 fn flash_query_tile_count(tokens: usize) -> usize {
     tokens.div_ceil(FLASH_QUERY_TILE)
 }
@@ -2881,41 +2743,9 @@ unsafe fn exp_64_avx512(values: &mut [f32; 64]) {
     }
 }
 
-impl Da3BaseProjection {
-    /// Returns whether this is one of DA3-BASE's four repeated F32 projection
-    /// families at the locked benchmark resolution.
-    pub const fn is_supported(self) -> bool {
-        self.tokens == DA3_BASE_TOKENS_504X336
-            && matches!(
-                (self.input_channels, self.output_channels),
-                (768, 2304) | (768, 768) | (768, 3072) | (3072, 768)
-            )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn admits_only_the_documented_da3_base_projection_shapes() {
-        assert!(
-            Da3BaseProjection {
-                tokens: 865,
-                input_channels: 768,
-                output_channels: 2304,
-            }
-            .is_supported()
-        );
-        assert!(
-            !Da3BaseProjection {
-                tokens: 864,
-                input_channels: 768,
-                output_channels: 2304,
-            }
-            .is_supported()
-        );
-    }
 
     #[test]
     fn linear_row_selector_accepts_only_explicit_ab_variants() {

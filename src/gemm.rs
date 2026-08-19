@@ -71,6 +71,9 @@ pub struct GemmWithEpilogue<G: Gemm> {
     pub inner: G,
 }
 impl<G: Gemm> GemmWithEpilogue<G> {
+    // Matrix dimensions and optional epilogues are kept explicit at this
+    // low-level boundary so callers cannot accidentally hide a layout change.
+    #[allow(clippy::too_many_arguments)]
     pub fn gemm_bias_gelu(
         &self,
         m: usize,

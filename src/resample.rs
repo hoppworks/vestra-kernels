@@ -270,7 +270,7 @@ mod tests {
         let input = vec![10.0, 20.0];
         let mut out = vec![0f32; 4];
         bilinear_resize(&input, 1, 1, 2, 1, 4, &mut out);
-        let expected = vec![
+        let expected = [
             10.0,
             10.0 * 0.75 + 20.0 * 0.25,
             10.0 * 0.25 + 20.0 * 0.75,

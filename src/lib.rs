@@ -60,6 +60,37 @@ pub fn qkv_f32_da3_base(
     crate::specialized::qkv_f32_da3_base(input, weight, bias, q, k, v)
 }
 
+/// Attempts the fixed-shape AVX-512 projection kernel.
+///
+/// Returns `false` without modifying `output` when the shape or host ISA is
+/// unsupported, allowing callers to retain their generic GEMM fallback.
+pub fn linear_f32_da3_base(
+    m: usize,
+    n: usize,
+    k: usize,
+    input: &[f32],
+    weight: &[f32],
+    output: &mut [f32],
+) -> bool {
+    crate::specialized::linear_f32_da3_base(m, n, k, input, weight, output)
+}
+
+/// Attempts the fixed-shape AVX-512 online-attention kernel.
+///
+/// Returns `false` without modifying `output` when the DA3-BASE shape or host
+/// ISA is unsupported.
+pub fn flash_attention_f32_da3_base(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    heads: usize,
+    tokens: usize,
+    output: &mut [f32],
+) -> bool {
+    crate::specialized::flash_attention_f32_da3_base(query, key, value, heads, tokens, output)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn linear_bias_scale_f32_da3_base(
     m: usize,
     n: usize,

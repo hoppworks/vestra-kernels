@@ -215,6 +215,9 @@ pub fn prepare_winograd_f4_filter(weight: &[f32], in_c: usize, out_c: usize) -> 
 /// im2col: expandiert `input` (NCHW, N=1) zu einer `(out_c_rows=kh*kw*in_c) x (oh*ow)`
 /// Spaltenmatrix, sodass `conv2d` als eine einzige GEMM (`weight_mat @ col`) berechnet
 /// werden kann. `col` ist row-major mit Shape `(in_c*kh*kw) x (oh*ow)`.
+// Keeping all tensor dimensions explicit is intentional at the kernel
+// boundary; packaging them would obscure the NCHW-to-matrix layout contract.
+#[allow(clippy::too_many_arguments)]
 fn im2col(
     input: &[f32],
     in_c: usize,
@@ -531,12 +534,12 @@ pub fn conv3x3_winograd_f4_prepared(
                     let x = tx * 4;
                     for ic in 0..in_c {
                         let mut d = [[0.0; 6]; 6];
-                        for dy in 0..6 {
+                        for (dy, d_row) in d.iter_mut().enumerate() {
                             let sy = y as isize + dy as isize - 1;
-                            for dx in 0..6 {
+                            for (dx, sample) in d_row.iter_mut().enumerate() {
                                 let sx = x as isize + dx as isize - 1;
                                 if sy >= 0 && sy < ih as isize && sx >= 0 && sx < iw as isize {
-                                    d[dy][dx] = input[(ic * ih + sy as usize) * iw + sx as usize];
+                                    *sample = input[(ic * ih + sy as usize) * iw + sx as usize];
                                 }
                             }
                         }
@@ -620,17 +623,17 @@ pub fn conv3x3_winograd_f4_prepared(
                             )
                         };
                         let b = bias.map_or(0.0, |values| values[oc]);
-                        for dy in 0..4 {
-                            for dx in 0..4 {
+                        for (dy, tmp_row) in tmp.iter().enumerate() {
+                            for (dx, coefficients) in AT.iter().enumerate() {
                                 let oy = ty * 4 + dy;
                                 let ox = tx * 4 + dx;
                                 if oy < ih && ox < iw {
-                                    plane[oy * iw + ox] = tmp[dy][0] * AT[dx][0]
-                                        + tmp[dy][1] * AT[dx][1]
-                                        + tmp[dy][2] * AT[dx][2]
-                                        + tmp[dy][3] * AT[dx][3]
-                                        + tmp[dy][4] * AT[dx][4]
-                                        + tmp[dy][5] * AT[dx][5]
+                                    plane[oy * iw + ox] = tmp_row[0] * coefficients[0]
+                                        + tmp_row[1] * coefficients[1]
+                                        + tmp_row[2] * coefficients[2]
+                                        + tmp_row[3] * coefficients[3]
+                                        + tmp_row[4] * coefficients[4]
+                                        + tmp_row[5] * coefficients[5]
                                         + b;
                                 }
                             }
@@ -762,7 +765,7 @@ fn conv3x3_winograd_f2_impl(
                 // transform reads.
                 used_products.fill(0.0);
                 let used_external = crate::specialized::winograd_f2_blocked_f32(
-                    &transformed,
+                    transformed,
                     used_v,
                     used_products,
                     in_c,
@@ -1022,7 +1025,7 @@ pub fn conv_transpose2d(
     let ow = (iw - 1) * stride + kw;
     debug_assert_eq!(out.len(), out_c * oh * ow);
 
-    if kh == stride && kw == stride && in_c % 16 == 0 {
+    if kh == stride && kw == stride && in_c.is_multiple_of(16) {
         let prepared = prepare_nonoverlap_transpose_filter(weight, in_c, out_c, kh, kw);
         if conv_transpose2d_prepared(input, ih, iw, &prepared, bias, out) {
             return;
@@ -1259,14 +1262,14 @@ mod tests {
         // weight layout IOHW: [ic][oc][kh][kw]
         let mut weight = vec![0f32; in_c * out_c * kh * kw];
         // ic0->oc0: all ones (16 elems)
-        for i in 0..16 {
-            weight[i] = 1.0;
+        for value in weight.iter_mut().take(16) {
+            *value = 1.0;
         }
         // ic0->oc1: all zeros (default)
         // ic1->oc0: all zeros
         // ic1->oc1: constant 5.0
         for i in 0..16 {
-            weight[(1 * out_c + 1) * 16 + i] = 5.0;
+            weight[(out_c + 1) * 16 + i] = 5.0;
         }
         let bias = vec![1.0, -2.0];
         let oh = (ih - 1) * stride + kh;

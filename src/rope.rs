@@ -31,7 +31,7 @@ pub fn rope2d(x: &mut [f32], heads: usize, n: usize, head_dim: usize, pos_yx: &[
     assert_eq!(x.len(), heads * n * head_dim, "rope2d: x size mismatch");
     assert_eq!(pos_yx.len(), n * 2, "rope2d: pos_yx size mismatch");
     assert!(
-        head_dim % 4 == 0,
+        head_dim.is_multiple_of(4),
         "rope2d: head_dim must be divisible by 4, got {head_dim}"
     );
 

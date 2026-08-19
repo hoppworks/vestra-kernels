@@ -1082,8 +1082,8 @@ impl CudaRuntime {
             || width == 0
             || patch == 0
             || channels == 0
-            || height % patch != 0
-            || width % patch != 0
+            || !height.is_multiple_of(patch)
+            || !width.is_multiple_of(patch)
             || image.len != channels.saturating_mul(height).saturating_mul(width)
         {
             return Err(CudaError::Kernel(format!(

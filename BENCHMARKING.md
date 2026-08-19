@@ -9,6 +9,8 @@ cargo test --lib
 cargo test --tests
 cargo bench --bench gemm_bench
 cargo run --release --example current_shape_bench
+# Requires an external OpenMP BLIS installation and matching linker flags:
+cargo run --release --features blis-experiment --example blis_shape_bench
 ```
 
 Run target-specific experiments on the AMD Ryzen 9 9950X with

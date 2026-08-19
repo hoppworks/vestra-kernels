@@ -1,10 +1,14 @@
 //! AVX-512F kernels. This module is only ever compiled on `target_arch =
 //! "x86_64"` (see the `#[cfg(...)]` gate on the `mod simd_avx512;`
-//! declaration in `lib.rs`). It is developed on an aarch64 (Apple Silicon)
-//! host where AVX-512 cannot execute or even be emulated; see
-//! `docs/optimization-log.md` for how these kernels are verified on this
-//! machine (x86_64 compile-check + scalar oracle only — NOT numerically
-//! verified on real x86-64 hardware yet).
+//! declaration in `lib.rs`). Every path retains a scalar oracle; target-host
+//! qualification and the evidence boundary are documented in
+//! `BENCHMARKING.md`.
+
+#![allow(
+    clippy::approx_constant,
+    clippy::excessive_precision,
+    reason = "established SIMD polynomial coefficients are retained verbatim for numerical parity"
+)]
 
 use core::arch::x86_64::*;
 

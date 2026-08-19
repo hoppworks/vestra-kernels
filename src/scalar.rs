@@ -1,3 +1,5 @@
+use rayon::prelude::*;
+
 pub fn gemm_f32(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
     debug_assert_eq!(a.len(), m * k);
     debug_assert_eq!(b.len(), k * n);
@@ -111,6 +113,64 @@ fn layernorm_row(row: &mut [f32], gamma: &[f32], beta: &[f32], eps: f32) {
     }
 }
 
+pub fn gelu(x: &mut [f32]) {
+    const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    for v in x.iter_mut() {
+        *v = 0.5 * *v * (1.0 + erf(*v * INV_SQRT2));
+    }
+}
+
+// Abramowitz–Stegun 7.1.26 erf-Approximation (|error| < 1.5e-7).
+fn erf(x: f32) -> f32 {
+    let s = x.signum();
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let y = 1.0
+        - (((((1.061_405_4 * t - 1.453_152) * t) + 1.421_413_7) * t - 0.284_496_74) * t
+            + 0.254_829_6)
+            * t
+            * (-x * x).exp();
+    s * y
+}
+
+/// In-place per-column ("LayerScale") scale: `x[r,c] *= gamma[c]`. Mirrors
+/// `add_bias_rows`'s shape convention exactly (row-major `[rows, cols]`,
+/// one scale factor per column, broadcast over rows).
+pub fn layerscale(x: &mut [f32], rows: usize, cols: usize, gamma: &[f32]) {
+    debug_assert_eq!(x.len(), rows * cols);
+    debug_assert_eq!(gamma.len(), cols);
+    if rows >= 32 {
+        x.par_chunks_mut(cols).for_each(|row| {
+            for c in 0..cols {
+                row[c] *= gamma[c];
+            }
+        });
+    } else {
+        for row in x.chunks_mut(cols) {
+            for c in 0..cols {
+                row[c] *= gamma[c];
+            }
+        }
+    }
+}
+
+pub fn softmax_rows(x: &mut [f32], rows: usize, cols: usize) {
+    debug_assert_eq!(x.len(), rows * cols);
+    for r in 0..rows {
+        let row = &mut x[r * cols..(r + 1) * cols];
+        let m = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0;
+        for v in row.iter_mut() {
+            *v = (*v - m).exp();
+            sum += *v;
+        }
+        let inv = 1.0 / sum;
+        for v in row.iter_mut() {
+            *v *= inv;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{layernorm, layernorm_row};
@@ -176,62 +236,3 @@ mod tests {
         );
     }
 }
-
-pub fn gelu(x: &mut [f32]) {
-    const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
-    for v in x.iter_mut() {
-        *v = 0.5 * *v * (1.0 + erf(*v * INV_SQRT2));
-    }
-}
-
-// Abramowitz–Stegun 7.1.26 erf-Approximation (|error| < 1.5e-7).
-fn erf(x: f32) -> f32 {
-    let s = x.signum();
-    let x = x.abs();
-    let t = 1.0 / (1.0 + 0.327_591_1 * x);
-    let y = 1.0
-        - (((((1.061_405_4 * t - 1.453_152_0) * t) + 1.421_413_7) * t - 0.284_496_74) * t
-            + 0.254_829_59)
-            * t
-            * (-x * x).exp();
-    s * y
-}
-
-/// In-place per-column ("LayerScale") scale: `x[r,c] *= gamma[c]`. Mirrors
-/// `add_bias_rows`'s shape convention exactly (row-major `[rows, cols]`,
-/// one scale factor per column, broadcast over rows).
-pub fn layerscale(x: &mut [f32], rows: usize, cols: usize, gamma: &[f32]) {
-    debug_assert_eq!(x.len(), rows * cols);
-    debug_assert_eq!(gamma.len(), cols);
-    if rows >= 32 {
-        x.par_chunks_mut(cols).for_each(|row| {
-            for c in 0..cols {
-                row[c] *= gamma[c];
-            }
-        });
-    } else {
-        for row in x.chunks_mut(cols) {
-            for c in 0..cols {
-                row[c] *= gamma[c];
-            }
-        }
-    }
-}
-
-pub fn softmax_rows(x: &mut [f32], rows: usize, cols: usize) {
-    debug_assert_eq!(x.len(), rows * cols);
-    for r in 0..rows {
-        let row = &mut x[r * cols..(r + 1) * cols];
-        let m = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0;
-        for v in row.iter_mut() {
-            *v = (*v - m).exp();
-            sum += *v;
-        }
-        let inv = 1.0 / sum;
-        for v in row.iter_mut() {
-            *v *= inv;
-        }
-    }
-}
-use rayon::prelude::*;
