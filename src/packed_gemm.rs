@@ -71,6 +71,27 @@ impl PreparedLinearF32 {
         self.output_features
     }
 
+    /// Reports whether this process can use the serial panel microkernels.
+    ///
+    /// The answer is intentionally stable for the lifetime of an inference
+    /// executor: the environment switch and CPU ISA cannot change during a
+    /// process. A caller that owns a validated executor may snapshot it once
+    /// and use the unchecked serial entry points in its hot loop.
+    #[must_use]
+    pub fn serial_panel_kernel_available(&self) -> bool {
+        if std::env::var_os("DA3_KERNELS_DISABLE_PACKED_LINEAR").is_some() {
+            return false;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
+
     /// Executes an AVX-512 F32 projection at the locked DA3-BASE token count.
     ///
     /// Returns `false` without changing `output` when the host or input shape
@@ -157,6 +178,38 @@ impl PreparedLinearF32 {
         false
     }
 
+    /// Equivalent to [`Self::run_output_panel_rows_serial`] after an owning
+    /// executor has validated [`Self::serial_panel_kernel_available`] once.
+    ///
+    /// This avoids repeated environment and ISA dispatch in a tightly nested
+    /// MLP loop. It retains all shape assertions in debug builds; production
+    /// callers must use it only with the fixed DA3-BASE panel contract.
+    pub fn run_output_panel_rows_serial_validated(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        output_panel: usize,
+    ) -> bool {
+        debug_assert!(self.serial_panel_kernel_available());
+        let rows = input.len() / self.input_features;
+        debug_assert!(rows > 0 && rows <= ROW_TILE);
+        debug_assert_eq!(input.len(), rows * self.input_features);
+        debug_assert_eq!(output.len(), rows * PANEL_WIDTH);
+        debug_assert!(output_panel < self.output_features / PANEL_WIDTH);
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: availability and the fixed serial panel contract are
+            // validated by the executor before this hot path is selected.
+            unsafe { run_output_panel_rows_avx512(self, input, output, output_panel) };
+            true
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (input, output, output_panel);
+            false
+        }
+    }
+
     /// Adds one 64-wide input strip to every output panel for a small row
     /// range.  It is the FC2 counterpart to
     /// [`run_output_panel_rows_serial`].  Loading the prior partial sum and
@@ -187,6 +240,35 @@ impl PreparedLinearF32 {
             return true;
         }
         false
+    }
+
+    /// Equivalent to [`Self::accumulate_input_panel_rows_serial`] after an
+    /// owning executor has validated the immutable process-level dispatch.
+    pub fn accumulate_input_panel_rows_serial_validated(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        input_panel: usize,
+    ) -> bool {
+        debug_assert!(self.serial_panel_kernel_available());
+        let rows = input.len() / PANEL_WIDTH;
+        debug_assert!(self.input_features % PANEL_WIDTH == 0);
+        debug_assert!(rows > 0 && rows <= ROW_TILE);
+        debug_assert_eq!(input.len(), rows * PANEL_WIDTH);
+        debug_assert_eq!(output.len(), rows * self.output_features);
+        debug_assert!(input_panel < self.input_features / PANEL_WIDTH);
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: availability and the fixed serial panel contract are
+            // validated by the executor before this hot path is selected.
+            unsafe { accumulate_input_panel_rows_avx512(self, input, output, input_panel) };
+            true
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (input, output, input_panel);
+            false
+        }
     }
 
     #[cfg(test)]
@@ -396,12 +478,20 @@ mod tests {
                 .map(|index| ((index % 29) as f32 - 14.0) * 0.007_812_5)
                 .collect::<Vec<_>>();
             let prepared = PreparedLinearF32::try_new(&weights, k, n).expect("DA3 shape");
+            assert!(prepared.serial_panel_kernel_available());
             let mut whole = vec![0.0; rows * n];
             assert!(prepared.run_rows_serial(&input, &mut whole));
 
             for panel in 0..n / PANEL_WIDTH {
                 let mut one_panel = vec![0.0; rows * PANEL_WIDTH];
+                let mut validated_panel = vec![0.0; rows * PANEL_WIDTH];
                 assert!(prepared.run_output_panel_rows_serial(&input, &mut one_panel, panel));
+                assert!(prepared.run_output_panel_rows_serial_validated(
+                    &input,
+                    &mut validated_panel,
+                    panel,
+                ));
+                assert_eq!(validated_panel, one_panel);
                 for row in 0..rows {
                     assert_eq!(
                         &one_panel[row * PANEL_WIDTH..(row + 1) * PANEL_WIDTH],
@@ -426,6 +516,23 @@ mod tests {
                 ));
             }
             assert_eq!(accumulated, whole);
+
+            let mut validated_accumulated = vec![0.0; rows * n];
+            for input_panel in 0..k / PANEL_WIDTH {
+                let mut strip = vec![0.0; rows * PANEL_WIDTH];
+                for row in 0..rows {
+                    strip[row * PANEL_WIDTH..(row + 1) * PANEL_WIDTH].copy_from_slice(
+                        &input[row * k + input_panel * PANEL_WIDTH
+                            ..row * k + (input_panel + 1) * PANEL_WIDTH],
+                    );
+                }
+                assert!(prepared.accumulate_input_panel_rows_serial_validated(
+                    &strip,
+                    &mut validated_accumulated,
+                    input_panel,
+                ));
+            }
+            assert_eq!(validated_accumulated, whole);
         }
     }
 }
