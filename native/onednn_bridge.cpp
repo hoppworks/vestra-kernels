@@ -40,7 +40,7 @@ extern "C" vestra_onednn_conv2d *vestra_onednn_conv2d_create(
         omp_set_num_threads(16);
 
         const auto engine = dnnl::engine(dnnl::engine::kind::cpu, 0);
-        const auto stream = dnnl::stream(engine);
+        auto stream = dnnl::stream(engine);
         const auto src_desc = dnnl::memory::desc(
                 {1, static_cast<dnnl::memory::dim>(in_channels),
                         static_cast<dnnl::memory::dim>(height),
@@ -58,15 +58,14 @@ extern "C" vestra_onednn_conv2d *vestra_onednn_conv2d_create(
         const auto bias_desc = dnnl::memory::desc(
                 {static_cast<dnnl::memory::dim>(out_channels)},
                 dnnl::memory::data_type::f32, dnnl::memory::format_tag::x);
-        const auto desc = dnnl::convolution_forward::desc(
-                dnnl::prop_kind::forward_inference,
-                dnnl::algorithm::convolution_direct, src_desc, weights_desc,
-                bias_desc, dst_desc, {1, 1}, {1, 1}, {1, 1});
         dnnl::primitive_attr attr;
         attr.set_fpmath_mode(dnnl::fpmath_mode::strict);
         attr.set_accumulation_mode(dnnl::accumulation_mode::strict);
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
-        const auto pd = dnnl::convolution_forward::primitive_desc(desc, attr, engine);
+        const auto pd = dnnl::convolution_forward::primitive_desc(engine,
+                dnnl::prop_kind::forward_inference,
+                dnnl::algorithm::convolution_direct, src_desc, weights_desc,
+                bias_desc, dst_desc, {1, 1}, {1, 1}, {1, 1}, attr);
         const auto primitive = dnnl::convolution_forward(pd);
 
         const auto weight_source = dnnl::memory(weights_desc, engine,
