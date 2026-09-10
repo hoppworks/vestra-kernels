@@ -2191,10 +2191,7 @@ unsafe fn flash_attention_superblock32_avx512(
                 for value in &mut scores[row][..cols] {
                     *value -= new_max;
                 }
-                // Superblock scheduling is an independent experimental path;
-                // keep its numerical route fixed while the production QT8
-                // candidate is evaluated.
-                unsafe { exp_64_avx512(&mut scores[row], false) };
+                unsafe { exp_64_avx512(&mut scores[row], profile.fast_exp) };
                 for value in &scores[row][..cols] {
                     sums[sub][row] += *value;
                 }
