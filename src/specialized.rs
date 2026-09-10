@@ -17,10 +17,10 @@
     reason = "established SIMD polynomial coefficients are retained verbatim for numerical parity"
 )]
 
-#[cfg(da3_blis)]
-use std::sync::Once;
 #[cfg(target_arch = "x86_64")]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(da3_blis)]
+use std::sync::Once;
 use std::sync::{Arc, OnceLock};
 #[cfg(target_arch = "x86_64")]
 use std::time::Instant;
@@ -229,8 +229,9 @@ pub fn prepare_nonoverlap_transpose_oc16_f32(
                             * input_channels
                             + input)
                             * 16)
-                            + lane] = weight
-                            [((input * output_channels + output_block * 16 + lane) * kernel_h
+                            + lane] =
+                            weight[((input * output_channels + output_block * 16 + lane)
+                                * kernel_h
                                 + ky)
                                 * kernel_w
                                 + kx];
@@ -364,8 +365,8 @@ unsafe fn nonoverlap_transpose_oc16_avx512(
             _mm512_loadu_ps(values.as_ptr().add(output_block * 16))
         });
         for ix in 0..input_w {
-            let pixel = &pixels[(iy * input_w + ix) * input_channels
-                ..(iy * input_w + ix + 1) * input_channels];
+            let pixel = &pixels
+                [(iy * input_w + ix) * input_channels..(iy * input_w + ix + 1) * input_channels];
             for ky in 0..filter.kernel_h {
                 for kx in 0..filter.kernel_w {
                     let mut accumulator = _mm512_setzero_ps();
@@ -385,10 +386,10 @@ unsafe fn nonoverlap_transpose_oc16_avx512(
                             accumulator,
                         );
                     }
-                    let output_index = (iy * filter.kernel_h + ky) * output_w
-                        + ix * filter.kernel_w
-                        + kx;
-                    let indices = _mm512_add_epi32(plane_offsets, _mm512_set1_epi32(output_index as i32));
+                    let output_index =
+                        (iy * filter.kernel_h + ky) * output_w + ix * filter.kernel_w + kx;
+                    let indices =
+                        _mm512_add_epi32(plane_offsets, _mm512_set1_epi32(output_index as i32));
                     unsafe {
                         _mm512_i32scatter_ps(
                             output_ptr as *mut f32,
@@ -684,6 +685,32 @@ pub fn winograd_f2_blocked_f32(
     false
 }
 
+/// Exact-product microkernel for rn1's four `128 -> 128` residual
+/// convolutions. It is deliberately separate from the generic F(2) route:
+/// callers must prove rn1's ReLU-input and 4-tile geometry before selecting
+/// it. Two adjacent OC16 panels share each tile broadcast, while every lane
+/// retains the generic kernel's ascending-input FMA order.
+pub fn winograd_f2_blocked_rn1_128x128_tiles4_f32(u: &[f32], v: &[f32], m: &mut [f32]) -> bool {
+    const CHANNELS: usize = 128;
+    const TILES: usize = 4;
+    if std::env::var_os("DA3_RN1_F2_OC32").is_none()
+        || std::env::var_os("DA3_KERNELS_DISABLE_WINO").is_some()
+        || u.len() != 16 * CHANNELS * CHANNELS
+        || v.len() != 16 * CHANNELS * TILES
+        || m.len() != 16 * TILES * CHANNELS
+    {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
+        // SAFETY: the exact rn1 product layout and required ISA are checked
+        // above. Each output vector belongs to one independent tile/channel.
+        unsafe { winograd_f2_blocked_avx512_rn1_128x128_tiles4(u, v, m) };
+        return true;
+    }
+    false
+}
+
 /// Multiplies one F(4x4,3x3) Winograd tile block in the same blocked filter
 /// layout as [`winograd_f2_blocked_f32`], except with the six-by-six (36
 /// position) transform domain.  The F(4) runtime owns the transforms and
@@ -806,11 +833,7 @@ unsafe fn winograd_f2_blocked_avx512(
 /// verified path above.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,fma")]
-unsafe fn winograd_f2_blocked_avx512_out1_128x64_tiles4(
-    u: &[f32],
-    v: &[f32],
-    m: &mut [f32],
-) {
+unsafe fn winograd_f2_blocked_avx512_out1_128x64_tiles4(u: &[f32], v: &[f32], m: &mut [f32]) {
     use core::arch::x86_64::*;
     const INPUTS: usize = 128;
     const OUTPUTS: usize = 64;
@@ -837,6 +860,60 @@ unsafe fn winograd_f2_blocked_avx512_out1_128x64_tiles4(
                 _mm512_storeu_ps(m_position.add(OUTPUTS + output0), a1);
                 _mm512_storeu_ps(m_position.add(2 * OUTPUTS + output0), a2);
                 _mm512_storeu_ps(m_position.add(3 * OUTPUTS + output0), a3);
+            }
+        }
+    }
+}
+
+/// rn1-specific F(2) product. Pairing two OC16 vectors lets each of the four
+/// transformed activation scalars feed both panels, while the eight named
+/// accumulators preserve each output lane's input-channel order.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn winograd_f2_blocked_avx512_rn1_128x128_tiles4(u: &[f32], v: &[f32], m: &mut [f32]) {
+    use core::arch::x86_64::*;
+    const CHANNELS: usize = 128;
+    const TILES: usize = 4;
+    for position in 0..16 {
+        let u_position = unsafe { u.as_ptr().add(position * CHANNELS * CHANNELS) };
+        let v_position = unsafe { v.as_ptr().add(position * CHANNELS * TILES) };
+        let m_position = unsafe { m.as_mut_ptr().add(position * TILES * CHANNELS) };
+        for output0 in (0..CHANNELS).step_by(32) {
+            let mut a00 = _mm512_setzero_ps();
+            let mut a01 = _mm512_setzero_ps();
+            let mut a02 = _mm512_setzero_ps();
+            let mut a03 = _mm512_setzero_ps();
+            let mut a10 = _mm512_setzero_ps();
+            let mut a11 = _mm512_setzero_ps();
+            let mut a12 = _mm512_setzero_ps();
+            let mut a13 = _mm512_setzero_ps();
+            for input in 0..CHANNELS {
+                let filter = unsafe { u_position.add(input * CHANNELS + output0) };
+                let filter0 = unsafe { _mm512_loadu_ps(filter) };
+                let filter1 = unsafe { _mm512_loadu_ps(filter.add(16)) };
+                let values = unsafe { v_position.add(input * TILES) };
+                let value0 = _mm512_set1_ps(unsafe { *values });
+                let value1 = _mm512_set1_ps(unsafe { *values.add(1) });
+                let value2 = _mm512_set1_ps(unsafe { *values.add(2) });
+                let value3 = _mm512_set1_ps(unsafe { *values.add(3) });
+                a00 = _mm512_fmadd_ps(filter0, value0, a00);
+                a01 = _mm512_fmadd_ps(filter0, value1, a01);
+                a02 = _mm512_fmadd_ps(filter0, value2, a02);
+                a03 = _mm512_fmadd_ps(filter0, value3, a03);
+                a10 = _mm512_fmadd_ps(filter1, value0, a10);
+                a11 = _mm512_fmadd_ps(filter1, value1, a11);
+                a12 = _mm512_fmadd_ps(filter1, value2, a12);
+                a13 = _mm512_fmadd_ps(filter1, value3, a13);
+            }
+            unsafe {
+                _mm512_storeu_ps(m_position.add(output0), a00);
+                _mm512_storeu_ps(m_position.add(output0 + 16), a10);
+                _mm512_storeu_ps(m_position.add(CHANNELS + output0), a01);
+                _mm512_storeu_ps(m_position.add(CHANNELS + output0 + 16), a11);
+                _mm512_storeu_ps(m_position.add(2 * CHANNELS + output0), a02);
+                _mm512_storeu_ps(m_position.add(2 * CHANNELS + output0 + 16), a12);
+                _mm512_storeu_ps(m_position.add(3 * CHANNELS + output0), a03);
+                _mm512_storeu_ps(m_position.add(3 * CHANNELS + output0 + 16), a13);
             }
         }
     }
@@ -3052,6 +3129,43 @@ mod tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn rn1_oc32_product_matches_generic_f2_bitwise() {
+        if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+        const CHANNELS: usize = 128;
+        const TILES: usize = 4;
+        let u = (0..16 * CHANNELS * CHANNELS)
+            .map(|index| ((index % 97) as f32 - 48.0) * 0.001_953_125)
+            .collect::<Vec<_>>();
+        let v = (0..16 * CHANNELS * TILES)
+            .map(|index| ((index % 61) as f32 - 30.0) * 0.007_812_5)
+            .collect::<Vec<_>>();
+        let mut generic = vec![f32::NAN; 16 * TILES * CHANNELS];
+        let mut rn1 = vec![f32::NAN; generic.len()];
+        assert!(winograd_f2_blocked_f32(
+            &u,
+            &v,
+            &mut generic,
+            CHANNELS,
+            CHANNELS,
+            TILES,
+        ));
+        unsafe { std::env::set_var("DA3_RN1_F2_OC32", "1") };
+        let used = winograd_f2_blocked_rn1_128x128_tiles4_f32(&u, &v, &mut rn1);
+        unsafe { std::env::remove_var("DA3_RN1_F2_OC32") };
+        assert!(used);
+        assert_eq!(
+            rn1.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            generic
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+        );
+    }
+
     #[test]
     fn f4_blocked_winograd_matches_fma_accumulation() {
         let (inputs, outputs, tiles) = (5, 32, 2);
@@ -3108,12 +3222,10 @@ mod tests {
             winograd_f2_blocked_avx512_generic(&u, &v, &mut generic, inputs, outputs, tiles);
             winograd_f2_blocked_avx512_tiles4(&u, &v, &mut specialized, inputs, outputs);
         }
-        assert!(
-            generic
-                .iter()
-                .zip(&specialized)
-                .all(|(generic, specialized)| generic.to_bits() == specialized.to_bits()),
-        );
+        assert!(generic
+            .iter()
+            .zip(&specialized)
+            .all(|(generic, specialized)| generic.to_bits() == specialized.to_bits()),);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -3201,12 +3313,10 @@ mod tests {
             (&accumulate_4, &accumulate_6),
             (&accumulate_4, &accumulate_8x32),
         ] {
-            assert!(
-                control
-                    .iter()
-                    .zip(candidate)
-                    .all(|(a, b)| a.to_bits() == b.to_bits())
-            );
+            assert!(control
+                .iter()
+                .zip(candidate)
+                .all(|(a, b)| a.to_bits() == b.to_bits()));
         }
     }
 
@@ -3252,12 +3362,10 @@ mod tests {
                 true,
             );
         }
-        assert!(
-            control
-                .iter()
-                .zip(candidate)
-                .all(|(control, candidate)| control.to_bits() == candidate.to_bits())
-        );
+        assert!(control
+            .iter()
+            .zip(candidate)
+            .all(|(control, candidate)| control.to_bits() == candidate.to_bits()));
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -3299,12 +3407,10 @@ mod tests {
                 &profile,
             );
         }
-        assert!(
-            generic
-                .iter()
-                .zip(&packed_fast)
-                .all(|(generic, packed_fast)| generic.to_bits() == packed_fast.to_bits())
-        );
+        assert!(generic
+            .iter()
+            .zip(&packed_fast)
+            .all(|(generic, packed_fast)| generic.to_bits() == packed_fast.to_bits()));
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -3348,12 +3454,10 @@ mod tests {
                 false,
             );
         }
-        assert!(
-            tiled
-                .iter()
-                .zip(&superblock)
-                .all(|(a, b)| a.to_bits() == b.to_bits())
-        );
+        assert!(tiled
+            .iter()
+            .zip(&superblock)
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -3397,12 +3501,10 @@ mod tests {
                 &profile,
             );
         }
-        assert!(
-            tiled
-                .iter()
-                .zip(&ggml64)
-                .all(|(control, candidate)| control.to_bits() == candidate.to_bits())
-        );
+        assert!(tiled
+            .iter()
+            .zip(&ggml64)
+            .all(|(control, candidate)| control.to_bits() == candidate.to_bits()));
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -3446,12 +3548,10 @@ mod tests {
                 false,
             );
         }
-        assert!(
-            tiled
-                .iter()
-                .zip(&superblock)
-                .all(|(a, b)| a.to_bits() == b.to_bits())
-        );
+        assert!(tiled
+            .iter()
+            .zip(&superblock)
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
     }
 
     #[test]
@@ -3537,11 +3637,9 @@ mod tests {
                     .copied()
                     .collect::<Vec<_>>()
             );
-            assert!(
-                packed[dim * STRIDE + TOKENS..(dim + 1) * STRIDE]
-                    .iter()
-                    .all(|value| *value == 0.0)
-            );
+            assert!(packed[dim * STRIDE + TOKENS..(dim + 1) * STRIDE]
+                .iter()
+                .all(|value| *value == 0.0));
         }
     }
 
@@ -3567,12 +3665,10 @@ mod tests {
             linear_avx512_column_split_rows::<8>(m, n, k, &a, &b, &mut columns_8);
         }
         for candidate in [&rows_4, &rows_8, &columns_4, &columns_8] {
-            assert!(
-                rows_6
-                    .iter()
-                    .zip(candidate)
-                    .all(|(control, variant)| control.to_bits() == variant.to_bits()),
-            );
+            assert!(rows_6
+                .iter()
+                .zip(candidate)
+                .all(|(control, variant)| control.to_bits() == variant.to_bits()),);
         }
     }
 
@@ -3598,11 +3694,10 @@ mod tests {
             linear_bias_scale_avx512_column_split(m, n, k, &a, &b, &bias, &scale, &mut columns);
         }
         for candidate in [&rows_4, &rows_8, &columns] {
-            assert!(
-                rows.iter()
-                    .zip(candidate)
-                    .all(|(row, candidate)| row.to_bits() == candidate.to_bits()),
-            );
+            assert!(rows
+                .iter()
+                .zip(candidate)
+                .all(|(row, candidate)| row.to_bits() == candidate.to_bits()),);
         }
     }
 
@@ -3640,12 +3735,10 @@ mod tests {
             (&row_k, &column_k),
             (&row_v, &column_v),
         ] {
-            assert!(
-                control
-                    .iter()
-                    .zip(candidate)
-                    .all(|(control, candidate)| control.to_bits() == candidate.to_bits()),
-            );
+            assert!(control
+                .iter()
+                .zip(candidate)
+                .all(|(control, candidate)| control.to_bits() == candidate.to_bits()),);
         }
     }
 

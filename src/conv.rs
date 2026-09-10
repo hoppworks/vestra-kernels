@@ -1116,14 +1116,29 @@ fn conv3x3_winograd_f2_impl(
                 // the vector kernel's scattered stores and later inverse
                 // transform reads.
                 used_products.fill(0.0);
-                let used_external = crate::specialized::winograd_f2_blocked_f32(
-                    transformed,
-                    used_v,
-                    used_products,
-                    in_c,
-                    out_c,
-                    active,
-                );
+                // rn1 is the only residual stage with four ReLU-input
+                // 128->128 convolutions at this exact spatial geometry. Its
+                // opt-in product kernel retains the generic FMA order while
+                // pairing two OC16 panels to reuse broadcasts.
+                let rn1_product = relu_input
+                    && in_c == 128
+                    && out_c == 128
+                    && active == 4
+                    && matches!((ih, iw), (96, 144) | (144, 96));
+                let used_external = (rn1_product
+                    && crate::specialized::winograd_f2_blocked_rn1_128x128_tiles4_f32(
+                        transformed,
+                        used_v,
+                        used_products,
+                    ))
+                    || crate::specialized::winograd_f2_blocked_f32(
+                        transformed,
+                        used_v,
+                        used_products,
+                        in_c,
+                        out_c,
+                        active,
+                    );
                 if !used_external {
                     for position in 0..16 {
                         for local_tile in 0..active {
