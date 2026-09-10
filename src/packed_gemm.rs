@@ -309,43 +309,6 @@ impl PreparedLinearF32 {
         }
     }
 
-    /// Adds four consecutive 64-wide input strips to every output panel for
-    /// one small row tile.
-    ///
-    /// This is the grouped FC2 primitive for the hidden-strip MLP schedule.
-    /// It deliberately visits panels and hidden channels in the same ascending
-    /// order as four calls to [`Self::accumulate_input_panel_rows_serial`],
-    /// but keeps each 64-wide output panel resident across all four strips.
-    /// That removes three of four partial-output load/store rounds without
-    /// changing the F32 accumulation sequence.
-    pub fn accumulate_four_input_panel_rows_serial_validated(
-        &self,
-        input: [&[f32]; 4],
-        output: &mut [f32],
-        input_panels: [usize; 4],
-    ) -> bool {
-        debug_assert!(self.serial_panel_kernel_available());
-        let rows = input[0].len() / PANEL_WIDTH;
-        debug_assert!(self.input_features % PANEL_WIDTH == 0);
-        debug_assert!(rows > 0 && rows <= ROW_TILE);
-        debug_assert!(input.iter().all(|panel| panel.len() == rows * PANEL_WIDTH));
-        debug_assert_eq!(output.len(), rows * self.output_features);
-        debug_assert!(input_panels.windows(2).all(|pair| pair[0] + 1 == pair[1]));
-        debug_assert!(input_panels[3] < self.input_features / PANEL_WIDTH);
-        #[cfg(target_arch = "x86_64")]
-        {
-            // SAFETY: availability and the fixed serial panel contract are
-            // validated by the executor before this hot path is selected.
-            unsafe { accumulate_four_input_panels_rows_avx512(self, input, output, input_panels) };
-            true
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = (input, output, input_panels);
-            false
-        }
-    }
-
     #[cfg(test)]
     fn packed_panel(&self, panel: usize) -> &[f32] {
         &self.packed[panel * self.input_features * PANEL_WIDTH
@@ -571,66 +534,6 @@ unsafe fn accumulate_input_panel_rows_avx512(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,fma")]
-unsafe fn accumulate_four_input_panels_rows_avx512(
-    prepared: &PreparedLinearF32,
-    input: [&[f32]; 4],
-    output: &mut [f32],
-    input_panels: [usize; 4],
-) {
-    use core::arch::x86_64::*;
-
-    let n = prepared.output_features;
-    let rows = input[0].len() / PANEL_WIDTH;
-    for output_panel in 0..n / PANEL_WIDTH {
-        let mut accumulators = [[_mm512_setzero_ps(); 4]; ROW_TILE];
-        for row in 0..rows {
-            let destination = unsafe { output.as_ptr().add(row * n + output_panel * PANEL_WIDTH) };
-            for block in 0..4 {
-                accumulators[row][block] = unsafe { _mm512_loadu_ps(destination.add(block * 16)) };
-            }
-        }
-        for group_index in 0..4 {
-            let input_panel = input_panels[group_index];
-            let weights = &prepared.packed[(output_panel * prepared.input_features
-                + input_panel * PANEL_WIDTH)
-                * PANEL_WIDTH
-                ..(output_panel * prepared.input_features + (input_panel + 1) * PANEL_WIDTH)
-                    * PANEL_WIDTH];
-            for input_feature in 0..PANEL_WIDTH {
-                let weight = unsafe { weights.as_ptr().add(input_feature * PANEL_WIDTH) };
-                let vectors = unsafe {
-                    [
-                        _mm512_loadu_ps(weight),
-                        _mm512_loadu_ps(weight.add(16)),
-                        _mm512_loadu_ps(weight.add(32)),
-                        _mm512_loadu_ps(weight.add(48)),
-                    ]
-                };
-                for row in 0..rows {
-                    let value =
-                        _mm512_set1_ps(input[group_index][row * PANEL_WIDTH + input_feature]);
-                    for block in 0..4 {
-                        accumulators[row][block] =
-                            _mm512_fmadd_ps(value, vectors[block], accumulators[row][block]);
-                    }
-                }
-            }
-        }
-        for row in 0..rows {
-            let destination = unsafe {
-                output
-                    .as_mut_ptr()
-                    .add(row * n + output_panel * PANEL_WIDTH)
-            };
-            for block in 0..4 {
-                unsafe { _mm512_storeu_ps(destination.add(block * 16), accumulators[row][block]) };
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,48 +647,6 @@ mod tests {
                 ));
             }
             assert_eq!(validated_accumulated, whole);
-        }
-    }
-
-    #[test]
-    fn four_input_panel_accumulation_preserves_four_serial_calls_bitwise() {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("fma") {
-                return;
-            }
-            let k = 3072;
-            let n = 768;
-            let weights = (0..k * n)
-                .map(|index| ((index % 131) as f32 - 65.0) * 0.000_976_562_5)
-                .collect::<Vec<_>>();
-            let prepared = PreparedLinearF32::try_new(&weights, k, n).expect("DA3 FC2 shape");
-            for rows in [4, 6] {
-                let strips = std::array::from_fn(|strip_index| {
-                    (0..rows * PANEL_WIDTH)
-                        .map(|index| {
-                            (((index + strip_index * 19) % 97) as f32 - 48.0) * 0.007_812_5
-                        })
-                        .collect::<Vec<_>>()
-                });
-                let mut serial = (0..rows * n)
-                    .map(|index| ((index % 23) as f32 - 11.0) * 0.003_906_25)
-                    .collect::<Vec<_>>();
-                let mut grouped = serial.clone();
-                for (offset, strip) in strips.iter().enumerate() {
-                    assert!(prepared.accumulate_input_panel_rows_serial_validated(
-                        strip,
-                        &mut serial,
-                        12 + offset,
-                    ));
-                }
-                assert!(prepared.accumulate_four_input_panel_rows_serial_validated(
-                    [&strips[0], &strips[1], &strips[2], &strips[3]],
-                    &mut grouped,
-                    [12, 13, 14, 15],
-                ));
-                assert_eq!(grouped, serial, "rows={rows}");
-            }
         }
     }
 
