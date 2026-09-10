@@ -309,6 +309,50 @@ impl PreparedLinearF32 {
         }
     }
 
+    /// Adds two consecutive 64-wide FC2 input panels while retaining each
+    /// output panel's accumulator in registers across both reductions.
+    ///
+    /// Each output lane still sees the identical ascending FMA sequence: all
+    /// 64 elements of `first_input` precede all 64 elements of `second_input`.
+    /// Only the intermediate partial sum no longer makes a round trip through
+    /// memory between those two adjacent panels.
+    pub fn accumulate_two_input_panels_rows_serial_validated(
+        &self,
+        first_input: &[f32],
+        second_input: &[f32],
+        output: &mut [f32],
+        first_input_panel: usize,
+    ) -> bool {
+        debug_assert!(self.serial_panel_kernel_available());
+        let rows = first_input.len() / PANEL_WIDTH;
+        debug_assert!(self.input_features % PANEL_WIDTH == 0);
+        debug_assert!(rows > 0 && rows <= ROW_TILE);
+        debug_assert_eq!(first_input.len(), rows * PANEL_WIDTH);
+        debug_assert_eq!(second_input.len(), rows * PANEL_WIDTH);
+        debug_assert_eq!(output.len(), rows * self.output_features);
+        debug_assert!(first_input_panel + 1 < self.input_features / PANEL_WIDTH);
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: executor validation establishes the immutable packing,
+            // fixed row tile and the pair of adjacent input panels.
+            unsafe {
+                accumulate_two_input_panels_rows_avx512(
+                    self,
+                    first_input,
+                    second_input,
+                    output,
+                    first_input_panel,
+                )
+            };
+            true
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (first_input, second_input, output, first_input_panel);
+            false
+        }
+    }
+
     #[cfg(test)]
     fn packed_panel(&self, panel: usize) -> &[f32] {
         &self.packed[panel * self.input_features * PANEL_WIDTH
@@ -534,6 +578,70 @@ unsafe fn accumulate_input_panel_rows_avx512(
     }
 }
 
+/// Two consecutive FC2 input panels with one output-panel load/store pair.
+/// The input-panel loop is deliberately ascending to preserve every FMA
+/// reduction order of two calls to `accumulate_input_panel_rows_avx512`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn accumulate_two_input_panels_rows_avx512(
+    prepared: &PreparedLinearF32,
+    first_input: &[f32],
+    second_input: &[f32],
+    output: &mut [f32],
+    first_input_panel: usize,
+) {
+    use core::arch::x86_64::*;
+
+    let n = prepared.output_features;
+    let rows = first_input.len() / PANEL_WIDTH;
+    for output_panel in 0..n / PANEL_WIDTH {
+        let panel_base = output_panel * prepared.input_features;
+        let weights_for = |input_panel| {
+            &prepared.packed[(panel_base + input_panel * PANEL_WIDTH) * PANEL_WIDTH
+                ..(panel_base + (input_panel + 1) * PANEL_WIDTH) * PANEL_WIDTH]
+        };
+        let first_weights = weights_for(first_input_panel);
+        let second_weights = weights_for(first_input_panel + 1);
+        let mut accumulators = [[_mm512_setzero_ps(); 4]; ROW_TILE];
+        for row in 0..rows {
+            let destination = unsafe { output.as_ptr().add(row * n + output_panel * PANEL_WIDTH) };
+            for block in 0..4 {
+                accumulators[row][block] = unsafe { _mm512_loadu_ps(destination.add(block * 16)) };
+            }
+        }
+        for (input, weights) in [(first_input, first_weights), (second_input, second_weights)] {
+            for input_feature in 0..PANEL_WIDTH {
+                let weight = unsafe { weights.as_ptr().add(input_feature * PANEL_WIDTH) };
+                let vectors = unsafe {
+                    [
+                        _mm512_loadu_ps(weight),
+                        _mm512_loadu_ps(weight.add(16)),
+                        _mm512_loadu_ps(weight.add(32)),
+                        _mm512_loadu_ps(weight.add(48)),
+                    ]
+                };
+                for row in 0..rows {
+                    let value = _mm512_set1_ps(input[row * PANEL_WIDTH + input_feature]);
+                    for block in 0..4 {
+                        accumulators[row][block] =
+                            _mm512_fmadd_ps(value, vectors[block], accumulators[row][block]);
+                    }
+                }
+            }
+        }
+        for row in 0..rows {
+            let destination = unsafe {
+                output
+                    .as_mut_ptr()
+                    .add(row * n + output_panel * PANEL_WIDTH)
+            };
+            for block in 0..4 {
+                unsafe { _mm512_storeu_ps(destination.add(block * 16), accumulators[row][block]) };
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,6 +755,28 @@ mod tests {
                 ));
             }
             assert_eq!(validated_accumulated, whole);
+
+            let panel_input = |panel: usize| {
+                let mut strip = vec![0.0; rows * PANEL_WIDTH];
+                for row in 0..rows {
+                    strip[row * PANEL_WIDTH..(row + 1) * PANEL_WIDTH].copy_from_slice(
+                        &input[row * k + panel * PANEL_WIDTH..row * k + (panel + 1) * PANEL_WIDTH],
+                    );
+                }
+                strip
+            };
+            let mut paired_accumulated = vec![0.0; rows * n];
+            for input_panel in (0..k / PANEL_WIDTH).step_by(2) {
+                let first = panel_input(input_panel);
+                let second = panel_input(input_panel + 1);
+                assert!(prepared.accumulate_two_input_panels_rows_serial_validated(
+                    &first,
+                    &second,
+                    &mut paired_accumulated,
+                    input_panel,
+                ));
+            }
+            assert_eq!(paired_accumulated, whole);
         }
     }
 
