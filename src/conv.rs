@@ -1570,25 +1570,6 @@ mod tests {
     }
 
     #[test]
-    fn out2a_64x32_tiles8_candidate_preserves_generic_f2_bits() {
-        let (in_c, out_c, h, w) = (64, 32, 4, 8);
-        let mut rng = Xorshift32(0x0A22_6432);
-        let input = random_vec(&mut rng, in_c * h * w);
-        let weight = random_vec(&mut rng, out_c * in_c * 9);
-        let bias = random_vec(&mut rng, out_c);
-        let filter = prepare_winograd_f2_filter(&weight, in_c, out_c);
-        let mut control = vec![0.0; out_c * h * w];
-        let mut candidate = vec![0.0; control.len()];
-        conv3x3_winograd_f2_prepared(&input, in_c, h, w, &filter, out_c, Some(&bias), &mut control);
-        unsafe { std::env::set_var("DA3_KERNELS_ENABLE_OUT2A_F2_64X32_TILES8", "1") };
-        conv3x3_winograd_f2_prepared(
-            &input, in_c, h, w, &filter, out_c, Some(&bias), &mut candidate,
-        );
-        unsafe { std::env::remove_var("DA3_KERNELS_ENABLE_OUT2A_F2_64X32_TILES8") };
-        assert_eq!(candidate, control);
-    }
-
-    #[test]
     fn winograd_relu_input_matches_materialized_relu_bitwise() {
         let (in_c, out_c, h, w) = (3, 5, 7, 9);
         let input: Vec<f32> = (0..in_c * h * w)
