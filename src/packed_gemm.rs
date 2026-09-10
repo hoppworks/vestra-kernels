@@ -125,6 +125,70 @@ impl PreparedLinearF32 {
         false
     }
 
+    /// Computes one 64-wide output panel for a small contiguous row range.
+    ///
+    /// This is deliberately narrower than [`run_rows_serial`].  A fused MLP
+    /// can retain only one hidden-neuron strip per token slab, rather than
+    /// materialising the complete 3072-wide FC1 activation.  `output_panel`
+    /// is expressed in 64-wide units and the reduction still visits every
+    /// input feature in ascending order.
+    pub fn run_output_panel_rows_serial(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        output_panel: usize,
+    ) -> bool {
+        let rows = input.len().checked_div(self.input_features).unwrap_or(0);
+        if std::env::var_os("DA3_KERNELS_DISABLE_PACKED_LINEAR").is_some()
+            || rows == 0
+            || rows > ROW_TILE
+            || input.len() != rows * self.input_features
+            || output.len() != rows * PANEL_WIDTH
+            || output_panel >= self.output_features / PANEL_WIDTH
+        {
+            return false;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: shape, ISA and the selected packed panel were checked.
+            unsafe { run_output_panel_rows_avx512(self, input, output, output_panel) };
+            return true;
+        }
+        false
+    }
+
+    /// Adds one 64-wide input strip to every output panel for a small row
+    /// range.  It is the FC2 counterpart to
+    /// [`run_output_panel_rows_serial`].  Loading the prior partial sum and
+    /// then advancing the strip in ascending hidden-channel order preserves
+    /// the FC2 reduction order while allowing the caller to keep the hidden
+    /// activation cache-resident.
+    pub fn accumulate_input_panel_rows_serial(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        input_panel: usize,
+    ) -> bool {
+        let rows = input.len() / PANEL_WIDTH;
+        if std::env::var_os("DA3_KERNELS_DISABLE_PACKED_LINEAR").is_some()
+            || self.input_features % PANEL_WIDTH != 0
+            || rows == 0
+            || rows > ROW_TILE
+            || input.len() != rows * PANEL_WIDTH
+            || output.len() != rows * self.output_features
+            || input_panel >= self.input_features / PANEL_WIDTH
+        {
+            return false;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: shape, ISA and the selected packed K strip were checked.
+            unsafe { accumulate_input_panel_rows_avx512(self, input, output, input_panel) };
+            return true;
+        }
+        false
+    }
+
     #[cfg(test)]
     fn packed_panel(&self, panel: usize) -> &[f32] {
         &self.packed[panel * self.input_features * PANEL_WIDTH
@@ -171,6 +235,97 @@ unsafe fn run_rows_avx512(prepared: &PreparedLinearF32, input: &[f32], output: &
         }
         for row in 0..rows {
             let destination = unsafe { output.as_mut_ptr().add(row * n + panel * PANEL_WIDTH) };
+            for block in 0..4 {
+                unsafe { _mm512_storeu_ps(destination.add(block * 16), accumulators[row][block]) };
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn run_output_panel_rows_avx512(
+    prepared: &PreparedLinearF32,
+    input: &[f32],
+    output: &mut [f32],
+    output_panel: usize,
+) {
+    use core::arch::x86_64::*;
+
+    let k = prepared.input_features;
+    let rows = input.len() / k;
+    let weight_panel = &prepared.packed
+        [output_panel * k * PANEL_WIDTH..(output_panel + 1) * k * PANEL_WIDTH];
+    let mut accumulators = [[_mm512_setzero_ps(); 4]; ROW_TILE];
+    for input_feature in 0..k {
+        let weights = unsafe { weight_panel.as_ptr().add(input_feature * PANEL_WIDTH) };
+        let vectors = unsafe {
+            [
+                _mm512_loadu_ps(weights),
+                _mm512_loadu_ps(weights.add(16)),
+                _mm512_loadu_ps(weights.add(32)),
+                _mm512_loadu_ps(weights.add(48)),
+            ]
+        };
+        for row in 0..rows {
+            let value = _mm512_set1_ps(input[row * k + input_feature]);
+            for block in 0..4 {
+                accumulators[row][block] =
+                    _mm512_fmadd_ps(value, vectors[block], accumulators[row][block]);
+            }
+        }
+    }
+    for row in 0..rows {
+        let destination = unsafe { output.as_mut_ptr().add(row * PANEL_WIDTH) };
+        for block in 0..4 {
+            unsafe { _mm512_storeu_ps(destination.add(block * 16), accumulators[row][block]) };
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn accumulate_input_panel_rows_avx512(
+    prepared: &PreparedLinearF32,
+    input: &[f32],
+    output: &mut [f32],
+    input_panel: usize,
+) {
+    use core::arch::x86_64::*;
+
+    let n = prepared.output_features;
+    let rows = input.len() / PANEL_WIDTH;
+    for output_panel in 0..n / PANEL_WIDTH {
+        let weights = &prepared.packed[(output_panel * prepared.input_features + input_panel * PANEL_WIDTH)
+            * PANEL_WIDTH..(output_panel * prepared.input_features + (input_panel + 1) * PANEL_WIDTH)
+                * PANEL_WIDTH];
+        let mut accumulators = [[_mm512_setzero_ps(); 4]; ROW_TILE];
+        for row in 0..rows {
+            let destination = unsafe { output.as_ptr().add(row * n + output_panel * PANEL_WIDTH) };
+            for block in 0..4 {
+                accumulators[row][block] = unsafe { _mm512_loadu_ps(destination.add(block * 16)) };
+            }
+        }
+        for input_feature in 0..PANEL_WIDTH {
+            let weight = unsafe { weights.as_ptr().add(input_feature * PANEL_WIDTH) };
+            let vectors = unsafe {
+                [
+                    _mm512_loadu_ps(weight),
+                    _mm512_loadu_ps(weight.add(16)),
+                    _mm512_loadu_ps(weight.add(32)),
+                    _mm512_loadu_ps(weight.add(48)),
+                ]
+            };
+            for row in 0..rows {
+                let value = _mm512_set1_ps(input[row * PANEL_WIDTH + input_feature]);
+                for block in 0..4 {
+                    accumulators[row][block] =
+                        _mm512_fmadd_ps(value, vectors[block], accumulators[row][block]);
+                }
+            }
+        }
+        for row in 0..rows {
+            let destination = unsafe { output.as_mut_ptr().add(row * n + output_panel * PANEL_WIDTH) };
             for block in 0..4 {
                 unsafe { _mm512_storeu_ps(destination.add(block * 16), accumulators[row][block]) };
             }
