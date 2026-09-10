@@ -761,7 +761,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let prepared = PreparedLinearF32::try_new(&weights, k, n).expect("DA3 FC2 shape");
             for rows in [4, 6] {
-                let strips: [Vec<f32>; 4] = std::array::from_fn(|strip_index| {
+                let strips = std::array::from_fn(|strip_index| {
                     (0..rows * PANEL_WIDTH)
                         .map(|index| {
                             (((index + strip_index * 19) % 97) as f32 - 48.0) * 0.007_812_5
