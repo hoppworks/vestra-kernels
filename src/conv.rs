@@ -20,6 +20,29 @@ static WINOGRAD_FILTERS: OnceLock<Mutex<HashMap<WinogradFilterKey, Arc<[f32]>>>>
 // matrices for every block while keeping each worker's storage private.
 thread_local! {
     static WINOGRAD_SCRATCH: RefCell<(Vec<f32>, Vec<f32>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    static RESIZE_RING_SCRATCH: RefCell<ResizeRingScratch> = const { RefCell::new(ResizeRingScratch::new()) };
+}
+
+/// Per-worker storage for the final resize → F(2) streaming route.  Four
+/// tagged output rows cover one 4×4 Winograd input window; advancing one tile
+/// row retains two rows and replaces two.  It is intentionally distinct from
+/// the generic product scratch because it remains live for a whole stripe.
+struct ResizeRingScratch {
+    rows: Vec<f32>,
+    row_tags: [isize; 4],
+    v: Vec<f32>,
+    products: Vec<f32>,
+}
+
+impl ResizeRingScratch {
+    const fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            row_tags: [isize::MIN; 4],
+            v: Vec::new(),
+            products: Vec::new(),
+        }
+    }
 }
 
 /// Four tiles is the measured Zen-5 default: it keeps the transformed input
@@ -341,6 +364,18 @@ pub fn conv3x3_winograd_f2_prepared_resize_align_corners(
     debug_assert!(add.is_none_or(|values| values.len() == in_c * oh * ow));
     debug_assert_eq!(out.len(), out_c * oh * ow);
 
+    if std::env::var_os("DA3_FUSED_FINAL_RESIZE_ROW_RING").is_some()
+        && matches!(
+            (in_c, out_c, ih, iw, oh, ow),
+            (64, 32, 192, 288, 336, 504) | (64, 32, 288, 192, 504, 336)
+        )
+    {
+        conv3x3_winograd_f2_prepared_resize_align_corners_ring(
+            input, in_c, ih, iw, oh, ow, add, filter, out_c, bias, out,
+        );
+        return;
+    }
+
     // Keep the coordinate calculation and f32 weights byte-for-byte aligned
     // with `resample::src_coord_align_corners` / its caller.
     let coords = |dst: usize, len_in: usize, len_out: usize| {
@@ -498,6 +533,202 @@ pub fn conv3x3_winograd_f2_prepared_resize_align_corners(
                 }
             });
         });
+}
+
+/// Exact-shape streaming variant of the fused final resize/F(2) operation.
+///
+/// The normal fused path evaluates the same bilinear source sample for every
+/// overlapping 4×4 tile window. This route retains four padded resized rows
+/// for each input channel per worker and runs contiguous output-tile-row
+/// stripes. It changes data lifetime only: interpolation expression,
+/// Winograd transform, blocked product kernel and inverse transform are the
+/// same as [`conv3x3_winograd_f2_prepared_resize_align_corners`].
+#[allow(clippy::too_many_arguments)]
+fn conv3x3_winograd_f2_prepared_resize_align_corners_ring(
+    input: &[f32],
+    in_c: usize,
+    ih: usize,
+    iw: usize,
+    oh: usize,
+    ow: usize,
+    add: Option<&[f32]>,
+    filter: &WinogradF2Filter,
+    out_c: usize,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) {
+    let coords = |dst: usize, len_in: usize, len_out: usize| {
+        let src = dst as f32 * (len_in - 1) as f32 / (len_out - 1) as f32;
+        let idx0 = (src.floor() as usize).min(len_in - 1);
+        let idx1 = (idx0 + 1).min(len_in - 1);
+        let frac = if idx1 == idx0 { 0.0 } else { src - idx0 as f32 };
+        (idx0, idx1, frac.clamp(0.0, 1.0))
+    };
+    let y: Vec<_> = (0..oh).map(|dst| coords(dst, ih, oh)).collect();
+    let x: Vec<_> = (0..ow).map(|dst| coords(dst, iw, ow)).collect();
+    let tiles_y = oh / 2;
+    let tiles_x = ow / 2;
+    let stripe_count = 16usize.min(tiles_y);
+    let pitch = ow + 2;
+    let transformed = &filter.0;
+    let out_ptr = out.as_mut_ptr() as usize;
+
+    (0..stripe_count).into_par_iter().for_each(|stripe| {
+        let ty_start = tiles_y * stripe / stripe_count;
+        let ty_end = tiles_y * (stripe + 1) / stripe_count;
+        RESIZE_RING_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.rows.resize(in_c * 4 * pitch, 0.0);
+            scratch.row_tags = [isize::MIN; 4];
+
+            let fill_row = |global_y: isize, scratch: &mut ResizeRingScratch| {
+                let slot = global_y.rem_euclid(4) as usize;
+                if scratch.row_tags[slot] == global_y {
+                    return;
+                }
+                scratch.row_tags[slot] = global_y;
+                for ic in 0..in_c {
+                    let row =
+                        &mut scratch.rows[(ic * 4 + slot) * pitch..(ic * 4 + slot + 1) * pitch];
+                    row.fill(0.0);
+                    if global_y < 0 || global_y >= oh as isize {
+                        continue;
+                    }
+                    let gy = global_y as usize;
+                    let (y0, y1, fy) = y[gy];
+                    let input_plane = &input[ic * ih * iw..(ic + 1) * ih * iw];
+                    let row0 = &input_plane[y0 * iw..(y0 + 1) * iw];
+                    let row1 = &input_plane[y1 * iw..(y1 + 1) * iw];
+                    let add_plane = add.map(|values| &values[ic * oh * ow..(ic + 1) * oh * ow]);
+                    for gx in 0..ow {
+                        let (x0, x1, fx) = x[gx];
+                        let top = row0[x0] * (1.0 - fx) + row0[x1] * fx;
+                        let bot = row1[x0] * (1.0 - fx) + row1[x1] * fx;
+                        row[gx + 1] = top * (1.0 - fy)
+                            + bot * fy
+                            + add_plane.map_or(0.0, |plane| plane[gy * ow + gx]);
+                    }
+                }
+            };
+
+            for ty in ty_start..ty_end {
+                let oy0 = ty * 2;
+                for dy in 0..4 {
+                    fill_row(oy0 as isize + dy as isize - 1, &mut scratch);
+                }
+                // Keeping a batch inside its tile row is what makes the ring
+                // reuse deterministic. Four is the established product block.
+                for tx0 in (0..tiles_x).step_by(4) {
+                    let active = (tiles_x - tx0).min(4);
+                    scratch.v.resize(16 * in_c * active, 0.0);
+                    scratch.products.resize(16 * active * out_c, 0.0);
+                    for local_tile in 0..active {
+                        let tx = tx0 + local_tile;
+                        for ic in 0..in_c {
+                            let mut d = [0.0; 16];
+                            for dy in 0..4 {
+                                let slot = (oy0 as isize + dy as isize - 1).rem_euclid(4) as usize;
+                                let ring_row = &scratch.rows
+                                    [(ic * 4 + slot) * pitch..(ic * 4 + slot + 1) * pitch];
+                                for dx in 0..4 {
+                                    d[dy * 4 + dx] = ring_row[2 * tx + dx];
+                                }
+                            }
+                            let mut column = [0.0; 16];
+                            for j in 0..4 {
+                                let (a, b, c, d3) = (d[j], d[4 + j], d[8 + j], d[12 + j]);
+                                column[j] = a - c;
+                                column[4 + j] = b + c;
+                                column[8 + j] = c - b;
+                                column[12 + j] = b - d3;
+                            }
+                            for i in 0..4 {
+                                let (a, b, c, d3) = (
+                                    column[i * 4],
+                                    column[i * 4 + 1],
+                                    column[i * 4 + 2],
+                                    column[i * 4 + 3],
+                                );
+                                scratch.v[(i * 4) * in_c * active + ic * active + local_tile] =
+                                    a - c;
+                                scratch.v[(i * 4 + 1) * in_c * active + ic * active + local_tile] =
+                                    b + c;
+                                scratch.v[(i * 4 + 2) * in_c * active + ic * active + local_tile] =
+                                    c - b;
+                                scratch.v[(i * 4 + 3) * in_c * active + ic * active + local_tile] =
+                                    b - d3;
+                            }
+                        }
+                    }
+                    scratch.products.fill(0.0);
+                    let used_external = {
+                        let ResizeRingScratch { v, products, .. } = &mut *scratch;
+                        crate::specialized::winograd_f2_blocked_f32(
+                            transformed,
+                            &*v,
+                            products,
+                            in_c,
+                            out_c,
+                            active,
+                        )
+                    };
+                    if !used_external {
+                        for position in 0..16 {
+                            for local_tile in 0..active {
+                                for oc in 0..out_c {
+                                    let mut sum = 0.0;
+                                    for ic in 0..in_c {
+                                        sum += transformed[(position * in_c + ic) * out_c + oc]
+                                            * scratch.v
+                                                [(position * in_c + ic) * active + local_tile];
+                                    }
+                                    scratch.products
+                                        [(position * active + local_tile) * out_c + oc] = sum;
+                                }
+                            }
+                        }
+                    }
+                    for local_tile in 0..active {
+                        let tx = tx0 + local_tile;
+                        for oc in 0..out_c {
+                            let mut p = [0.0; 8];
+                            for j in 0..4 {
+                                p[j] = scratch.products[(j * active + local_tile) * out_c + oc]
+                                    + scratch.products
+                                        [((4 + j) * active + local_tile) * out_c + oc]
+                                    + scratch.products
+                                        [((8 + j) * active + local_tile) * out_c + oc];
+                                p[4 + j] = scratch.products
+                                    [((4 + j) * active + local_tile) * out_c + oc]
+                                    - scratch.products
+                                        [((8 + j) * active + local_tile) * out_c + oc]
+                                    - scratch.products
+                                        [((12 + j) * active + local_tile) * out_c + oc];
+                            }
+                            let b = bias.map_or(0.0, |values| values[oc]);
+                            let plane = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (out_ptr as *mut f32).add(oc * oh * ow),
+                                    oh * ow,
+                                )
+                            };
+                            let values = [
+                                p[0] + p[1] + p[2] + b,
+                                p[1] - p[2] - p[3] + b,
+                                p[4] + p[5] + p[6] + b,
+                                p[5] - p[6] - p[7] + b,
+                            ];
+                            for dy in 0..2 {
+                                for dx in 0..2 {
+                                    plane[(oy0 + dy) * ow + tx * 2 + dx] = values[dy * 2 + dx];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    });
 }
 
 /// Opt-in F(4x4, 3x3) Winograd convolution for the final DA3 head layer.
@@ -1282,7 +1513,7 @@ mod tests {
         let kw = 4;
         let stride = 4;
         let input = vec![2.0, 3.0]; // ic0=2, ic1=3
-        // weight layout IOHW: [ic][oc][kh][kw]
+                                    // weight layout IOHW: [ic][oc][kh][kw]
         let mut weight = vec![0f32; in_c * out_c * kh * kw];
         // ic0->oc0: all ones (16 elems)
         for value in weight.iter_mut().take(16) {
@@ -1440,10 +1671,9 @@ mod tests {
             Some(&bias),
             &mut expected,
         );
-        let prepared = prepare_nonoverlap_transpose_oc16_filter(
-            &weight, in_c, out_c, kernel, kernel,
-        )
-        .expect("OC16 dimensions");
+        let prepared =
+            prepare_nonoverlap_transpose_oc16_filter(&weight, in_c, out_c, kernel, kernel)
+                .expect("OC16 dimensions");
         let mut actual = vec![0.0; expected.len()];
         if !conv_transpose2d_oc16_prepared(&input, ih, iw, &prepared, Some(&bias), &mut actual) {
             // Non-x86 and non-AVX512 hosts retain the generic path. The
@@ -1551,7 +1781,16 @@ mod tests {
         let filter = prepare_winograd_f2_filter(&weight, in_c, out_c);
         let mut control = vec![0.0; out_c * h * w];
         let mut candidate = vec![0.0; control.len()];
-        conv3x3_winograd_f2_prepared(&input, in_c, h, w, &filter, out_c, Some(&bias), &mut control);
+        conv3x3_winograd_f2_prepared(
+            &input,
+            in_c,
+            h,
+            w,
+            &filter,
+            out_c,
+            Some(&bias),
+            &mut control,
+        );
         // Tests execute serially in the benchmark harness for this
         // environment; restore the process setting immediately afterwards.
         unsafe { std::env::set_var("DA3_KERNELS_ENABLE_OUT1_F2_128X64", "1") };
@@ -1674,6 +1913,62 @@ mod tests {
                 .map(|value| value.to_bits())
                 .collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn resize_ring_matches_fused_route_bitwise_and_overwrites_reused_scratch() {
+        // Deliberately use more than four output tile rows, signed UV and a
+        // nonzero bias.  The second run uses different data to make stale
+        // ring-row tags or values observable.
+        let (in_c, out_c, ih, iw, oh, ow) = (16, 12, 7, 5, 12, 10);
+        let mut rng = Xorshift32(0xA716_0001);
+        let weight = random_vec(&mut rng, out_c * in_c * 9);
+        let bias = random_vec(&mut rng, out_c);
+        let filter = prepare_winograd_f2_filter(&weight, in_c, out_c);
+        for round in 0..2 {
+            let input = random_vec(&mut rng, in_c * ih * iw);
+            let add = random_vec(&mut rng, in_c * oh * ow);
+            let mut expected = vec![0.0; out_c * oh * ow];
+            conv3x3_winograd_f2_prepared_resize_align_corners(
+                &input,
+                in_c,
+                ih,
+                iw,
+                oh,
+                ow,
+                Some(&add),
+                &filter,
+                out_c,
+                Some(&bias),
+                &mut expected,
+            );
+            let mut actual = vec![f32::NAN; out_c * oh * ow];
+            conv3x3_winograd_f2_prepared_resize_align_corners_ring(
+                &input,
+                in_c,
+                ih,
+                iw,
+                oh,
+                ow,
+                Some(&add),
+                &filter,
+                out_c,
+                Some(&bias),
+                &mut actual,
+            );
+            assert!(actual.iter().all(|value| !value.is_nan()), "round={round}");
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "round={round}",
+            );
+        }
     }
 
     #[test]
