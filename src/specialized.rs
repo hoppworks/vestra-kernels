@@ -153,6 +153,24 @@ pub struct NonoverlapTransposeF32 {
     kernel_w: usize,
 }
 
+/// Model-owned IOHW filter packed for sixteen output channels at once.
+///
+/// The established transpose path vectorizes the input-channel reduction,
+/// then horizontally reduces it once per output channel. DA3's two DPT
+/// reassemble layers have channel counts divisible by sixteen, so this
+/// opt-in layout instead holds one independent output-channel accumulator in
+/// every AVX-512 lane. It is deliberately a separate type: callers must opt
+/// in after validating its different, but K-ascending, F32 reduction order.
+#[derive(Clone)]
+pub struct NonoverlapTransposeOc16F32 {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    packed: Arc<[f32]>,
+    input_channels: usize,
+    output_channels: usize,
+    kernel_h: usize,
+    kernel_w: usize,
+}
+
 /// Converts an immutable IOHW transposed-convolution filter into the layout
 /// consumed by [`nonoverlap_transpose_f32`].
 pub fn prepare_nonoverlap_transpose_f32(
@@ -187,6 +205,49 @@ pub fn prepare_nonoverlap_transpose_f32(
     }
 }
 
+/// Packs an immutable IOHW filter as `[oc16][ky][kx][ic][lane]`.
+pub fn prepare_nonoverlap_transpose_oc16_f32(
+    weight: &[f32],
+    input_channels: usize,
+    output_channels: usize,
+    kernel_h: usize,
+    kernel_w: usize,
+) -> Option<NonoverlapTransposeOc16F32> {
+    if !input_channels.is_multiple_of(16)
+        || !output_channels.is_multiple_of(16)
+        || weight.len() != input_channels * output_channels * kernel_h * kernel_w
+    {
+        return None;
+    }
+    let mut packed = vec![0.0; weight.len()];
+    for output_block in 0..output_channels / 16 {
+        for ky in 0..kernel_h {
+            for kx in 0..kernel_w {
+                for input in 0..input_channels {
+                    for lane in 0..16 {
+                        packed[((((output_block * kernel_h + ky) * kernel_w + kx)
+                            * input_channels
+                            + input)
+                            * 16)
+                            + lane] = weight
+                            [((input * output_channels + output_block * 16 + lane) * kernel_h
+                                + ky)
+                                * kernel_w
+                                + kx];
+                    }
+                }
+            }
+        }
+    }
+    Some(NonoverlapTransposeOc16F32 {
+        packed: packed.into(),
+        input_channels,
+        output_channels,
+        kernel_h,
+        kernel_w,
+    })
+}
+
 /// Executes DA3's non-overlapping `kernel == stride` transposed convolution
 /// from a prepacked, model-owned filter. Returns `false` when the CPU or
 /// tensor geometry is unsupported, leaving the caller's fallback available.
@@ -215,6 +276,131 @@ pub fn nonoverlap_transpose_f32(
         return true;
     }
     false
+}
+
+/// Executes the opt-in OC16 transpose kernel.
+///
+/// It is not selected by the established prepared route. The Engine owns the
+/// environment-gated dispatch so a full model parity gate is required before
+/// it can become the default.
+pub fn nonoverlap_transpose_oc16_f32(
+    input: &[f32],
+    input_h: usize,
+    input_w: usize,
+    filter: &NonoverlapTransposeOc16F32,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) -> bool {
+    if std::env::var_os("DA3_KERNELS_DISABLE_TRANSPOSE_OC16").is_some()
+        || input.len() != filter.input_channels * input_h * input_w
+        || bias.is_some_and(|values| values.len() != filter.output_channels)
+        || out.len()
+            != filter.output_channels * input_h * filter.kernel_h * input_w * filter.kernel_w
+    {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
+        // SAFETY: validated fixed-width channel layout and non-overlapping
+        // output ownership; jobs write disjoint OC16 plane groups.
+        unsafe { nonoverlap_transpose_oc16_avx512(input, input_h, input_w, filter, bias, out) };
+        return true;
+    }
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn nonoverlap_transpose_oc16_avx512(
+    input: &[f32],
+    input_h: usize,
+    input_w: usize,
+    filter: &NonoverlapTransposeOc16F32,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) {
+    use core::arch::x86_64::*;
+    use rayon::prelude::*;
+
+    let input_channels = filter.input_channels;
+    let output_h = input_h * filter.kernel_h;
+    let output_w = input_w * filter.kernel_w;
+    let output_plane = output_h * output_w;
+    let mut pixels = vec![0.0f32; input_h * input_w * input_channels];
+    for iy in 0..input_h {
+        for ix in 0..input_w {
+            let destination = &mut pixels
+                [(iy * input_w + ix) * input_channels..(iy * input_w + ix + 1) * input_channels];
+            for input_channel in 0..input_channels {
+                destination[input_channel] = input[(input_channel * input_h + iy) * input_w + ix];
+            }
+        }
+    }
+    let output_ptr = out.as_mut_ptr() as usize;
+    let blocks = filter.output_channels / 16;
+    (0..blocks * input_h).into_par_iter().for_each(|job| {
+        let output_block = job / input_h;
+        let iy = job % input_h;
+        let lane_base = output_block * 16 * output_plane;
+        let plane_offsets = _mm512_set_epi32(
+            (lane_base + 15 * output_plane) as i32,
+            (lane_base + 14 * output_plane) as i32,
+            (lane_base + 13 * output_plane) as i32,
+            (lane_base + 12 * output_plane) as i32,
+            (lane_base + 11 * output_plane) as i32,
+            (lane_base + 10 * output_plane) as i32,
+            (lane_base + 9 * output_plane) as i32,
+            (lane_base + 8 * output_plane) as i32,
+            (lane_base + 7 * output_plane) as i32,
+            (lane_base + 6 * output_plane) as i32,
+            (lane_base + 5 * output_plane) as i32,
+            (lane_base + 4 * output_plane) as i32,
+            (lane_base + 3 * output_plane) as i32,
+            (lane_base + 2 * output_plane) as i32,
+            (lane_base + output_plane) as i32,
+            lane_base as i32,
+        );
+        let bias_v = bias.map_or(_mm512_setzero_ps(), |values| unsafe {
+            _mm512_loadu_ps(values.as_ptr().add(output_block * 16))
+        });
+        for ix in 0..input_w {
+            let pixel = &pixels[(iy * input_w + ix) * input_channels
+                ..(iy * input_w + ix + 1) * input_channels];
+            for ky in 0..filter.kernel_h {
+                for kx in 0..filter.kernel_w {
+                    let mut accumulator = _mm512_setzero_ps();
+                    for input_channel in 0..input_channels {
+                        let weights = unsafe {
+                            filter.packed.as_ptr().add(
+                                ((((output_block * filter.kernel_h + ky) * filter.kernel_w + kx)
+                                    * input_channels
+                                    + input_channel)
+                                    * 16),
+                            )
+                        };
+                        let weight_v = unsafe { _mm512_loadu_ps(weights) };
+                        accumulator = _mm512_fmadd_ps(
+                            _mm512_set1_ps(pixel[input_channel]),
+                            weight_v,
+                            accumulator,
+                        );
+                    }
+                    let output_index = (iy * filter.kernel_h + ky) * output_w
+                        + ix * filter.kernel_w
+                        + kx;
+                    let indices = _mm512_add_epi32(plane_offsets, _mm512_set1_epi32(output_index as i32));
+                    unsafe {
+                        _mm512_i32scatter_ps(
+                            output_ptr as *mut f32,
+                            indices,
+                            _mm512_add_ps(accumulator, bias_v),
+                            4,
+                        );
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[cfg(target_arch = "x86_64")]

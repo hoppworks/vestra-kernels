@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub use crate::specialized::NonoverlapTransposeF32;
+pub use crate::specialized::{NonoverlapTransposeF32, NonoverlapTransposeOc16F32};
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 struct WinogradFilterKey {
@@ -101,6 +101,29 @@ pub fn conv_transpose2d_prepared(
     out: &mut [f32],
 ) -> bool {
     crate::specialized::nonoverlap_transpose_f32(input, ih, iw, filter, bias, out)
+}
+
+/// Prepares the opt-in OC16 layout used by the DA3 DPT reassemble candidate.
+pub fn prepare_nonoverlap_transpose_oc16_filter(
+    weight: &[f32],
+    in_c: usize,
+    out_c: usize,
+    kh: usize,
+    kw: usize,
+) -> Option<NonoverlapTransposeOc16F32> {
+    crate::specialized::prepare_nonoverlap_transpose_oc16_f32(weight, in_c, out_c, kh, kw)
+}
+
+/// Executes the separate OC16 candidate from a model-owned prepared filter.
+pub fn conv_transpose2d_oc16_prepared(
+    input: &[f32],
+    ih: usize,
+    iw: usize,
+    filter: &NonoverlapTransposeOc16F32,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) -> bool {
+    crate::specialized::nonoverlap_transpose_oc16_f32(input, ih, iw, filter, bias, out)
 }
 
 fn winograd_filter_key(weight: &[f32], in_c: usize, out_c: usize) -> WinogradFilterKey {
@@ -1393,6 +1416,46 @@ mod tests {
             }
         }
         assert_eq!(fast, serial);
+    }
+
+    #[test]
+    fn oc16_transpose_matches_generic_nonoverlap_oracle() {
+        let (in_c, out_c, ih, iw, kernel) = (16, 16, 3, 2, 2);
+        let mut rng = Xorshift32(0x0C16_0001);
+        let input = random_vec(&mut rng, in_c * ih * iw);
+        let weight = random_vec(&mut rng, in_c * out_c * kernel * kernel);
+        let bias = random_vec(&mut rng, out_c);
+        let (oh, ow) = (ih * kernel, iw * kernel);
+        let mut expected = vec![0.0; out_c * oh * ow];
+        conv_transpose2d_naive(
+            &input,
+            in_c,
+            ih,
+            iw,
+            &weight,
+            out_c,
+            kernel,
+            kernel,
+            kernel,
+            Some(&bias),
+            &mut expected,
+        );
+        let prepared = prepare_nonoverlap_transpose_oc16_filter(
+            &weight, in_c, out_c, kernel, kernel,
+        )
+        .expect("OC16 dimensions");
+        let mut actual = vec![0.0; expected.len()];
+        if !conv_transpose2d_oc16_prepared(&input, ih, iw, &prepared, Some(&bias), &mut actual) {
+            // Non-x86 and non-AVX512 hosts retain the generic path. The
+            // fixed-shape, numerical oracle still runs on the Workhorse.
+            return;
+        }
+        for (index, (observed, reference)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (observed - reference).abs() <= 2e-5,
+                "index={index}: OC16={observed}, reference={reference}"
+            );
+        }
     }
 
     #[test]
