@@ -4,6 +4,7 @@
 //! kernel-owned value types. It deliberately contains no GGUF reader, model
 //! configuration, CLI, or engine types.
 
+pub mod packed_gemm;
 mod specialized;
 
 pub mod attention;
