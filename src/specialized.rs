@@ -60,7 +60,17 @@ unsafe extern "C" {
 #[cfg(da3_blis)]
 fn blis_sgemm_row_major(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) -> bool {
     static INITIALIZED: Once = Once::new();
-    INITIALIZED.call_once(|| unsafe { bli_thread_set_num_threads(16) });
+    INITIALIZED.call_once(|| {
+        // The fair DA3 CPU contract fixes the process budget at 16 threads.
+        // This override exists only for isolated backend experiments; the
+        // benchmark runner records it and production defaults remain 16.
+        let threads = std::env::var("DA3_BLIS_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(16);
+        unsafe { bli_thread_set_num_threads(threads) };
+    });
     let (m_i32, n_i32, k_i32) = (m as i32, n as i32, k as i32);
     let (alpha, beta, no_transpose) = (1.0f32, 0.0f32, b'N');
     // Row-major A[m,k] B[k,n] C[m,n] is exactly the same storage as the
