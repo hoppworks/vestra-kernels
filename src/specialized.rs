@@ -771,6 +771,18 @@ unsafe fn winograd_f2_blocked_avx512(
     output_channels: usize,
     tiles: usize,
 ) {
+    if tiles == 4
+        && input_channels == 128
+        && output_channels == 64
+        && std::env::var_os("DA3_KERNELS_ENABLE_OUT1_F2_128X64").is_some()
+    {
+        // The DA3-BASE output-head convolution is the only production F(2)
+        // call with this exact shape. Its static bounds let LLVM eliminate
+        // loop-carried shape arithmetic and slice bounds checks without
+        // altering either the FMA order or the transformed-tile layout.
+        unsafe { winograd_f2_blocked_avx512_out1_128x64_tiles4(u, v, m) };
+        return;
+    }
     // Keep the historically rejected all-convolution variant opt-in, but
     // allow the exact 64->32 final DPT head product to be isolated: it has
     // only two output ZMMs and can behave differently from the wider layers.
@@ -785,6 +797,48 @@ unsafe fn winograd_f2_blocked_avx512(
         unsafe {
             winograd_f2_blocked_avx512_generic(u, v, m, input_channels, output_channels, tiles)
         };
+    }
+}
+
+/// Exact DA3-BASE `head.scratch.out1` product: 16 transformed positions,
+/// four input tiles, 128 input channels and 64 output channels. This is an
+/// intentionally opt-in microkernel; any other shape remains on the generic
+/// verified path above.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn winograd_f2_blocked_avx512_out1_128x64_tiles4(
+    u: &[f32],
+    v: &[f32],
+    m: &mut [f32],
+) {
+    use core::arch::x86_64::*;
+    const INPUTS: usize = 128;
+    const OUTPUTS: usize = 64;
+    const TILES: usize = 4;
+    for position in 0..16 {
+        let u_position = unsafe { u.as_ptr().add(position * INPUTS * OUTPUTS) };
+        let v_position = unsafe { v.as_ptr().add(position * INPUTS * TILES) };
+        let m_position = unsafe { m.as_mut_ptr().add(position * TILES * OUTPUTS) };
+        for output0 in (0..OUTPUTS).step_by(16) {
+            let mut a0 = _mm512_setzero_ps();
+            let mut a1 = _mm512_setzero_ps();
+            let mut a2 = _mm512_setzero_ps();
+            let mut a3 = _mm512_setzero_ps();
+            for input in 0..INPUTS {
+                let filter = unsafe { _mm512_loadu_ps(u_position.add(input * OUTPUTS + output0)) };
+                let values = unsafe { v_position.add(input * TILES) };
+                a0 = _mm512_fmadd_ps(filter, _mm512_set1_ps(unsafe { *values }), a0);
+                a1 = _mm512_fmadd_ps(filter, _mm512_set1_ps(unsafe { *values.add(1) }), a1);
+                a2 = _mm512_fmadd_ps(filter, _mm512_set1_ps(unsafe { *values.add(2) }), a2);
+                a3 = _mm512_fmadd_ps(filter, _mm512_set1_ps(unsafe { *values.add(3) }), a3);
+            }
+            unsafe {
+                _mm512_storeu_ps(m_position.add(output0), a0);
+                _mm512_storeu_ps(m_position.add(OUTPUTS + output0), a1);
+                _mm512_storeu_ps(m_position.add(2 * OUTPUTS + output0), a2);
+                _mm512_storeu_ps(m_position.add(3 * OUTPUTS + output0), a3);
+            }
+        }
     }
 }
 
