@@ -17,6 +17,12 @@ thiserror = "2"
 default = []
 cuda = ["dep:cudarc"]
 blis-experiment = []
+# Opt-in only. The native dependency is supplied by an explicitly pinned local
+# oneDNN build; ordinary Cargo builds never download or discover it.
+onednn-experiment = []
+
+[build-dependencies]
+cc = "1"
 
 [dev-dependencies]
 criterion = "0.5"

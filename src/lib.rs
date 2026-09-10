@@ -7,6 +7,9 @@
 pub mod packed_gemm;
 mod specialized;
 
+#[cfg(feature = "onednn-experiment")]
+pub mod onednn;
+
 pub mod attention;
 pub mod conv;
 pub mod gemm;
