@@ -535,6 +535,104 @@ pub fn conv3x3_winograd_f2_prepared_resize_align_corners(
         });
 }
 
+/// Streams an exact align-corners resize directly into a prepared 128→128
+/// pointwise projection.  The destination remains CHW, but each Rayon job
+/// owns a small temporary `[pixels, channels]` row-major tile required by the
+/// packed AVX-512 projection.  This deliberately preserves resize-before-1x1
+/// evaluation; it is not the algebraic commute experiment.
+#[allow(clippy::too_many_arguments)]
+pub fn resize_align_corners_1x1_prepared(
+    input: &[f32],
+    in_c: usize,
+    ih: usize,
+    iw: usize,
+    oh: usize,
+    ow: usize,
+    projection: &crate::packed_gemm::PreparedLinearF32,
+    bias: &[f32],
+    out: &mut [f32],
+) -> bool {
+    const CHANNELS: usize = 128;
+    const ROW_TILE: usize = 6;
+    const PIXELS_PER_JOB: usize = 96;
+    #[cfg(target_arch = "x86_64")]
+    let supports_avx512 =
+        std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let supports_avx512 = false;
+    if std::env::var_os("DA3_STREAM_RESIZE_1X1_DISABLE").is_some()
+        || in_c != CHANNELS
+        || projection.input_features() != CHANNELS
+        || projection.output_features() != CHANNELS
+        || bias.len() != CHANNELS
+        || input.len() != in_c * ih * iw
+        || out.len() != CHANNELS * oh * ow
+        || !supports_avx512
+    {
+        return false;
+    }
+    let coords = |dst: usize, len_in: usize, len_out: usize| {
+        let src = dst as f32 * (len_in - 1) as f32 / (len_out - 1) as f32;
+        let idx0 = (src.floor() as usize).min(len_in - 1);
+        let idx1 = (idx0 + 1).min(len_in - 1);
+        let frac = if idx1 == idx0 { 0.0 } else { src - idx0 as f32 };
+        (idx0, idx1, frac.clamp(0.0, 1.0))
+    };
+    let y: Vec<_> = (0..oh).map(|dst| coords(dst, ih, oh)).collect();
+    let x: Vec<_> = (0..ow).map(|dst| coords(dst, iw, ow)).collect();
+    let pixels = oh * ow;
+    let out_ptr = out.as_mut_ptr() as usize;
+    (0..pixels)
+        .into_par_iter()
+        .step_by(PIXELS_PER_JOB)
+        .for_each_init(
+            || {
+                (
+                    vec![0.0; ROW_TILE * CHANNELS],
+                    vec![0.0; ROW_TILE * CHANNELS],
+                )
+            },
+            |(resized, projected), pixel0| {
+                let pixel_end = (pixel0 + PIXELS_PER_JOB).min(pixels);
+                for group0 in (pixel0..pixel_end).step_by(ROW_TILE) {
+                    let active = (pixel_end - group0).min(ROW_TILE);
+                    for local in 0..active {
+                        let pixel = group0 + local;
+                        let oy = pixel / ow;
+                        let ox = pixel % ow;
+                        let (y0, y1, fy) = y[oy];
+                        let (x0, x1, fx) = x[ox];
+                        for ic in 0..CHANNELS {
+                            let plane = &input[ic * ih * iw..(ic + 1) * ih * iw];
+                            let row0 = &plane[y0 * iw..(y0 + 1) * iw];
+                            let row1 = &plane[y1 * iw..(y1 + 1) * iw];
+                            let top = row0[x0] * (1.0 - fx) + row0[x1] * fx;
+                            let bottom = row1[x0] * (1.0 - fx) + row1[x1] * fx;
+                            resized[local * CHANNELS + ic] = top * (1.0 - fy) + bottom * fy;
+                        }
+                    }
+                    assert!(projection.run_rows_serial(
+                        &resized[..active * CHANNELS],
+                        &mut projected[..active * CHANNELS],
+                    ));
+                    for local in 0..active {
+                        let pixel = group0 + local;
+                        for oc in 0..CHANNELS {
+                            // SAFETY: each outer work item owns a disjoint
+                            // destination-pixel interval, and each channel
+                            // plane has the same interval partition.
+                            unsafe {
+                                *((out_ptr as *mut f32).add(oc * pixels + pixel)) =
+                                    projected[local * CHANNELS + oc] + bias[oc];
+                            }
+                        }
+                    }
+                }
+            },
+        );
+    true
+}
+
 /// Exact-shape streaming variant of the fused final resize/F(2) operation.
 ///
 /// The normal fused path evaluates the same bilinear source sample for every

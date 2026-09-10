@@ -199,7 +199,7 @@ impl PreparedLinearF32 {
 fn is_da3_base_projection_shape(input_features: usize, output_features: usize) -> bool {
     matches!(
         (input_features, output_features),
-        (768, 2304) | (768, 768) | (768, 3072) | (3072, 768)
+        (128, 128) | (768, 2304) | (768, 768) | (768, 3072) | (3072, 768)
     )
 }
 
@@ -212,8 +212,7 @@ unsafe fn run_rows_avx512(prepared: &PreparedLinearF32, input: &[f32], output: &
     let k = prepared.input_features;
     let rows = input.len() / k;
     for panel in 0..n / PANEL_WIDTH {
-        let weight_panel =
-            &prepared.packed[panel * k * PANEL_WIDTH..(panel + 1) * k * PANEL_WIDTH];
+        let weight_panel = &prepared.packed[panel * k * PANEL_WIDTH..(panel + 1) * k * PANEL_WIDTH];
         let mut accumulators = [[_mm512_setzero_ps(); 4]; ROW_TILE];
         for input_feature in 0..k {
             let weights = unsafe { weight_panel.as_ptr().add(input_feature * PANEL_WIDTH) };
@@ -254,8 +253,8 @@ unsafe fn run_output_panel_rows_avx512(
 
     let k = prepared.input_features;
     let rows = input.len() / k;
-    let weight_panel = &prepared.packed
-        [output_panel * k * PANEL_WIDTH..(output_panel + 1) * k * PANEL_WIDTH];
+    let weight_panel =
+        &prepared.packed[output_panel * k * PANEL_WIDTH..(output_panel + 1) * k * PANEL_WIDTH];
     let mut accumulators = [[_mm512_setzero_ps(); 4]; ROW_TILE];
     for input_feature in 0..k {
         let weights = unsafe { weight_panel.as_ptr().add(input_feature * PANEL_WIDTH) };
@@ -296,8 +295,10 @@ unsafe fn accumulate_input_panel_rows_avx512(
     let n = prepared.output_features;
     let rows = input.len() / PANEL_WIDTH;
     for output_panel in 0..n / PANEL_WIDTH {
-        let weights = &prepared.packed[(output_panel * prepared.input_features + input_panel * PANEL_WIDTH)
-            * PANEL_WIDTH..(output_panel * prepared.input_features + (input_panel + 1) * PANEL_WIDTH)
+        let weights = &prepared.packed[(output_panel * prepared.input_features
+            + input_panel * PANEL_WIDTH)
+            * PANEL_WIDTH
+            ..(output_panel * prepared.input_features + (input_panel + 1) * PANEL_WIDTH)
                 * PANEL_WIDTH];
         let mut accumulators = [[_mm512_setzero_ps(); 4]; ROW_TILE];
         for row in 0..rows {
@@ -325,7 +326,11 @@ unsafe fn accumulate_input_panel_rows_avx512(
             }
         }
         for row in 0..rows {
-            let destination = unsafe { output.as_mut_ptr().add(row * n + output_panel * PANEL_WIDTH) };
+            let destination = unsafe {
+                output
+                    .as_mut_ptr()
+                    .add(row * n + output_panel * PANEL_WIDTH)
+            };
             for block in 0..4 {
                 unsafe { _mm512_storeu_ps(destination.add(block * 16), accumulators[row][block]) };
             }
@@ -378,9 +383,7 @@ mod tests {
     fn hidden_strip_primitives_preserve_full_projection_bits() {
         #[cfg(target_arch = "x86_64")]
         {
-            if !std::is_x86_feature_detected!("avx512f")
-                || !std::is_x86_feature_detected!("fma")
-            {
+            if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("fma") {
                 return;
             }
             let k = 768;
