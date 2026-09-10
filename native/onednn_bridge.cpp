@@ -68,9 +68,9 @@ extern "C" vestra_onednn_conv2d *vestra_onednn_conv2d_create(
                 bias_desc, dst_desc, {1, 1}, {1, 1}, {1, 1}, attr);
         const auto primitive = dnnl::convolution_forward(pd);
 
-        const auto weight_source = dnnl::memory(weights_desc, engine,
+        auto weight_source = dnnl::memory(weights_desc, engine,
                 const_cast<float *>(weight));
-        const auto prepared_weights = dnnl::memory(pd.weights_desc(), engine);
+        auto prepared_weights = dnnl::memory(pd.weights_desc(), engine);
         dnnl::reorder(weight_source, prepared_weights).execute(stream, weight_source,
                 prepared_weights);
         const auto prepared_bias = dnnl::memory(bias_desc, engine,
