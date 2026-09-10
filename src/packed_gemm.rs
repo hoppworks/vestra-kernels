@@ -209,4 +209,13 @@ mod tests {
         assert!(PreparedLinearF32::try_new(&[0.0; 4], 2, 2).is_none());
         assert!(PreparedLinearF32::try_new(&vec![0.0; 768 * 769], 768, 769).is_none());
     }
+
+    #[test]
+    fn serial_rows_rejects_tiles_larger_than_its_cache_contract() {
+        let prepared = PreparedLinearF32::try_new(&vec![0.0; 768 * 768], 768, 768)
+            .expect("DA3 projection shape");
+        let input = vec![0.0; 7 * 768];
+        let mut output = vec![0.0; 7 * 768];
+        assert!(!prepared.run_rows_serial(&input, &mut output));
+    }
 }
