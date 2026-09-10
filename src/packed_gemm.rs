@@ -373,4 +373,56 @@ mod tests {
         let mut output = vec![0.0; 7 * 768];
         assert!(!prepared.run_rows_serial(&input, &mut output));
     }
+
+    #[test]
+    fn hidden_strip_primitives_preserve_full_projection_bits() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !std::is_x86_feature_detected!("avx512f")
+                || !std::is_x86_feature_detected!("fma")
+            {
+                return;
+            }
+            let k = 768;
+            let n = 768;
+            let rows = 2;
+            let weights = (0..k * n)
+                .map(|index| ((index % 37) as f32 - 18.0) * 0.001_953_125)
+                .collect::<Vec<_>>();
+            let input = (0..rows * k)
+                .map(|index| ((index % 29) as f32 - 14.0) * 0.007_812_5)
+                .collect::<Vec<_>>();
+            let prepared = PreparedLinearF32::try_new(&weights, k, n).expect("DA3 shape");
+            let mut whole = vec![0.0; rows * n];
+            assert!(prepared.run_rows_serial(&input, &mut whole));
+
+            for panel in 0..n / PANEL_WIDTH {
+                let mut one_panel = vec![0.0; rows * PANEL_WIDTH];
+                assert!(prepared.run_output_panel_rows_serial(&input, &mut one_panel, panel));
+                for row in 0..rows {
+                    assert_eq!(
+                        &one_panel[row * PANEL_WIDTH..(row + 1) * PANEL_WIDTH],
+                        &whole[row * n + panel * PANEL_WIDTH..row * n + (panel + 1) * PANEL_WIDTH]
+                    );
+                }
+            }
+
+            let mut accumulated = vec![0.0; rows * n];
+            for input_panel in 0..k / PANEL_WIDTH {
+                let mut strip = vec![0.0; rows * PANEL_WIDTH];
+                for row in 0..rows {
+                    strip[row * PANEL_WIDTH..(row + 1) * PANEL_WIDTH].copy_from_slice(
+                        &input[row * k + input_panel * PANEL_WIDTH
+                            ..row * k + (input_panel + 1) * PANEL_WIDTH],
+                    );
+                }
+                assert!(prepared.accumulate_input_panel_rows_serial(
+                    &strip,
+                    &mut accumulated,
+                    input_panel,
+                ));
+            }
+            assert_eq!(accumulated, whole);
+        }
+    }
 }
