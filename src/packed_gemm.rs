@@ -1,6 +1,6 @@
 //! Model-owned panel packing for the fixed DA3-BASE F32 projection shapes.
 //!
-//! The normal row-major GGUF layout makes a 64-column panel advance by a full
+//! The normal row-major GGUF layout makes a 32-column panel advance by a full
 //! output row for every K value. `PreparedLinearF32` stores each such panel as
 //! contiguous K-major vectors. Packing is performed at model-load time, never
 //! on the timed inference path.
@@ -12,11 +12,15 @@ use rayon::prelude::*;
 
 use crate::specialized::DA3_BASE_TOKENS_504X336;
 
-pub const PANEL_WIDTH: usize = 64;
+pub const PANEL_WIDTH: usize = 32;
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-const ROW_TILE: usize = 6;
+const ROW_TILE: usize = 12;
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+const ROW_BLOCK: usize = 60;
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+const COLUMN_BLOCK: usize = 256;
 
-/// Immutable DA3 projection weights packed as `[n_panel][k][64]`.
+/// Immutable DA3 projection weights packed as `[n_panel][k][32]`.
 ///
 /// The source and output matrices remain row-major. Only the persistent model
 /// weight layout changes, so every output still accumulates K in ascending
@@ -37,6 +41,7 @@ impl PreparedLinearF32 {
     /// layout for unrelated models.
     pub fn try_new(weight: &[f32], input_features: usize, output_features: usize) -> Option<Self> {
         if !is_da3_base_projection_shape(input_features, output_features)
+            || !output_features.is_multiple_of(COLUMN_BLOCK)
             || weight.len() != input_features * output_features
         {
             return None;
@@ -115,42 +120,44 @@ unsafe fn run_da3_base_avx512(prepared: &PreparedLinearF32, input: &[f32], outpu
     let n = prepared.output_features;
     let k = prepared.input_features;
     let panels = n / PANEL_WIDTH;
+    let row_blocks = DA3_BASE_TOKENS_504X336.div_ceil(ROW_BLOCK);
+    let column_blocks = n / COLUMN_BLOCK;
     let output_ptr = output.as_mut_ptr() as usize;
-    (0..DA3_BASE_TOKENS_504X336)
-        .step_by(ROW_TILE)
-        .collect::<Vec<_>>()
+    (0..row_blocks * column_blocks)
         .into_par_iter()
-        .for_each(|row0| {
-            let rows = (DA3_BASE_TOKENS_504X336 - row0).min(ROW_TILE);
-            for panel in 0..panels {
+        .for_each(|job| {
+            let row_block = job / column_blocks;
+            let column_block = job % column_blocks;
+            let row_start = row_block * ROW_BLOCK;
+            let row_end = (row_start + ROW_BLOCK).min(DA3_BASE_TOKENS_504X336);
+            let panel_start = column_block * (COLUMN_BLOCK / PANEL_WIDTH);
+            let panel_end = (panel_start + COLUMN_BLOCK / PANEL_WIDTH).min(panels);
+            for panel in panel_start..panel_end {
                 let weight_panel =
                     &prepared.packed[panel * k * PANEL_WIDTH..(panel + 1) * k * PANEL_WIDTH];
-                let mut accumulators = [[_mm512_setzero_ps(); 4]; ROW_TILE];
-                for input_feature in 0..k {
-                    let weights = unsafe { weight_panel.as_ptr().add(input_feature * PANEL_WIDTH) };
-                    let vectors = unsafe {
-                        [
-                            _mm512_loadu_ps(weights),
-                            _mm512_loadu_ps(weights.add(16)),
-                            _mm512_loadu_ps(weights.add(32)),
-                            _mm512_loadu_ps(weights.add(48)),
-                        ]
-                    };
-                    for row in 0..rows {
-                        let value = _mm512_set1_ps(input[(row0 + row) * k + input_feature]);
-                        for block in 0..4 {
-                            accumulators[row][block] =
-                                _mm512_fmadd_ps(value, vectors[block], accumulators[row][block]);
+                for row0 in (row_start..row_end).step_by(ROW_TILE) {
+                    let rows = (row_end - row0).min(ROW_TILE);
+                    let mut accumulators = [[_mm512_setzero_ps(); 2]; ROW_TILE];
+                    for input_feature in 0..k {
+                        let weights =
+                            unsafe { weight_panel.as_ptr().add(input_feature * PANEL_WIDTH) };
+                        let vectors =
+                            unsafe { [_mm512_loadu_ps(weights), _mm512_loadu_ps(weights.add(16))] };
+                        for row in 0..rows {
+                            let value = _mm512_set1_ps(input[(row0 + row) * k + input_feature]);
+                            accumulators[row][0] =
+                                _mm512_fmadd_ps(value, vectors[0], accumulators[row][0]);
+                            accumulators[row][1] =
+                                _mm512_fmadd_ps(value, vectors[1], accumulators[row][1]);
                         }
                     }
-                }
-                for row in 0..rows {
-                    let destination = unsafe {
-                        (output_ptr as *mut f32).add((row0 + row) * n + panel * PANEL_WIDTH)
-                    };
-                    for block in 0..4 {
+                    for row in 0..rows {
+                        let destination = unsafe {
+                            (output_ptr as *mut f32).add((row0 + row) * n + panel * PANEL_WIDTH)
+                        };
                         unsafe {
-                            _mm512_storeu_ps(destination.add(block * 16), accumulators[row][block]);
+                            _mm512_storeu_ps(destination, accumulators[row][0]);
+                            _mm512_storeu_ps(destination.add(16), accumulators[row][1]);
                         }
                     }
                 }
@@ -171,10 +178,10 @@ mod tests {
             .collect::<Vec<_>>();
         let prepared = PreparedLinearF32::try_new(&weight, k, n).expect("DA3 shape");
         assert_eq!(prepared.packed.len(), weight.len());
-        for panel in [0, 3, 11] {
+        for panel in [0, 3, 23] {
             let packed = prepared.packed_panel(panel);
             for input in [0, 7, 511, 767] {
-                for lane in [0, 15, 31, 63] {
+                for lane in [0, 15, 31] {
                     assert_eq!(
                         packed[input * PANEL_WIDTH + lane].to_bits(),
                         weight[input * n + panel * PANEL_WIDTH + lane].to_bits()
