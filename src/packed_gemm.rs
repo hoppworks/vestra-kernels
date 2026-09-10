@@ -12,15 +12,11 @@ use rayon::prelude::*;
 
 use crate::specialized::DA3_BASE_TOKENS_504X336;
 
-pub const PANEL_WIDTH: usize = 32;
+pub const PANEL_WIDTH: usize = 64;
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-const ROW_TILE: usize = 12;
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-const ROW_BLOCK: usize = 60;
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-const COLUMN_BLOCK: usize = 256;
+const ROW_TILE: usize = 6;
 
-/// Immutable DA3 projection weights packed as `[n_panel][k][32]`.
+/// Immutable DA3 projection weights packed as `[n_panel][k][64]`.
 ///
 /// The source and output matrices remain row-major. Only the persistent model
 /// weight layout changes, so every output still accumulates K in ascending
@@ -41,7 +37,6 @@ impl PreparedLinearF32 {
     /// layout for unrelated models.
     pub fn try_new(weight: &[f32], input_features: usize, output_features: usize) -> Option<Self> {
         if !is_da3_base_projection_shape(input_features, output_features)
-            || !output_features.is_multiple_of(COLUMN_BLOCK)
             || weight.len() != input_features * output_features
         {
             return None;
@@ -92,7 +87,39 @@ impl PreparedLinearF32 {
         if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
             // SAFETY: fixed dimensions, buffer lengths, packed layout, and
             // required ISA were checked above.
-            unsafe { run_da3_base_avx512(self, input, output) };
+            input
+                .par_chunks(ROW_TILE * self.input_features)
+                .zip(output.par_chunks_mut(ROW_TILE * self.output_features))
+                .for_each(|(input_rows, output_rows)| {
+                    // SAFETY: the outer dimension checks above and chunk sizes
+                    // establish valid packed-projection buffers.
+                    unsafe { run_rows_avx512(self, input_rows, output_rows) };
+                });
+            return true;
+        }
+        false
+    }
+
+    /// Runs a small, contiguous row range on the calling thread.
+    ///
+    /// This is the building block for a fused MLP schedule: one Rayon work
+    /// item can retain its normalized rows and FC1 activation in private cache
+    /// while it executes FC1, GELU, and FC2. The public whole-matrix entry
+    /// above remains available for an isolated projection benchmark.
+    pub fn run_rows_serial(&self, input: &[f32], output: &mut [f32]) -> bool {
+        if std::env::var_os("DA3_KERNELS_DISABLE_PACKED_LINEAR").is_some()
+            || input.is_empty()
+            || input.len() % self.input_features != 0
+            || input.len() / self.input_features > ROW_TILE
+            || output.len() != (input.len() / self.input_features) * self.output_features
+        {
+            return false;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: checked shapes and ISA; the routine indexes only the
+            // supplied row range and immutable, model-owned packed weights.
+            unsafe { run_rows_avx512(self, input, output) };
             return true;
         }
         false
@@ -114,55 +141,41 @@ fn is_da3_base_projection_shape(input_features: usize, output_features: usize) -
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,fma")]
-unsafe fn run_da3_base_avx512(prepared: &PreparedLinearF32, input: &[f32], output: &mut [f32]) {
+unsafe fn run_rows_avx512(prepared: &PreparedLinearF32, input: &[f32], output: &mut [f32]) {
     use core::arch::x86_64::*;
 
     let n = prepared.output_features;
     let k = prepared.input_features;
-    let panels = n / PANEL_WIDTH;
-    let row_blocks = DA3_BASE_TOKENS_504X336.div_ceil(ROW_BLOCK);
-    let column_blocks = n / COLUMN_BLOCK;
-    let output_ptr = output.as_mut_ptr() as usize;
-    (0..row_blocks * column_blocks)
-        .into_par_iter()
-        .for_each(|job| {
-            let row_block = job / column_blocks;
-            let column_block = job % column_blocks;
-            let row_start = row_block * ROW_BLOCK;
-            let row_end = (row_start + ROW_BLOCK).min(DA3_BASE_TOKENS_504X336);
-            let panel_start = column_block * (COLUMN_BLOCK / PANEL_WIDTH);
-            let panel_end = (panel_start + COLUMN_BLOCK / PANEL_WIDTH).min(panels);
-            for panel in panel_start..panel_end {
-                let weight_panel =
-                    &prepared.packed[panel * k * PANEL_WIDTH..(panel + 1) * k * PANEL_WIDTH];
-                for row0 in (row_start..row_end).step_by(ROW_TILE) {
-                    let rows = (row_end - row0).min(ROW_TILE);
-                    let mut accumulators = [[_mm512_setzero_ps(); 2]; ROW_TILE];
-                    for input_feature in 0..k {
-                        let weights =
-                            unsafe { weight_panel.as_ptr().add(input_feature * PANEL_WIDTH) };
-                        let vectors =
-                            unsafe { [_mm512_loadu_ps(weights), _mm512_loadu_ps(weights.add(16))] };
-                        for row in 0..rows {
-                            let value = _mm512_set1_ps(input[(row0 + row) * k + input_feature]);
-                            accumulators[row][0] =
-                                _mm512_fmadd_ps(value, vectors[0], accumulators[row][0]);
-                            accumulators[row][1] =
-                                _mm512_fmadd_ps(value, vectors[1], accumulators[row][1]);
-                        }
-                    }
-                    for row in 0..rows {
-                        let destination = unsafe {
-                            (output_ptr as *mut f32).add((row0 + row) * n + panel * PANEL_WIDTH)
-                        };
-                        unsafe {
-                            _mm512_storeu_ps(destination, accumulators[row][0]);
-                            _mm512_storeu_ps(destination.add(16), accumulators[row][1]);
-                        }
-                    }
+    let rows = input.len() / k;
+    for panel in 0..n / PANEL_WIDTH {
+        let weight_panel =
+            &prepared.packed[panel * k * PANEL_WIDTH..(panel + 1) * k * PANEL_WIDTH];
+        let mut accumulators = [[_mm512_setzero_ps(); 4]; ROW_TILE];
+        for input_feature in 0..k {
+            let weights = unsafe { weight_panel.as_ptr().add(input_feature * PANEL_WIDTH) };
+            let vectors = unsafe {
+                [
+                    _mm512_loadu_ps(weights),
+                    _mm512_loadu_ps(weights.add(16)),
+                    _mm512_loadu_ps(weights.add(32)),
+                    _mm512_loadu_ps(weights.add(48)),
+                ]
+            };
+            for row in 0..rows {
+                let value = _mm512_set1_ps(input[row * k + input_feature]);
+                for block in 0..4 {
+                    accumulators[row][block] =
+                        _mm512_fmadd_ps(value, vectors[block], accumulators[row][block]);
                 }
             }
-        });
+        }
+        for row in 0..rows {
+            let destination = unsafe { output.as_mut_ptr().add(row * n + panel * PANEL_WIDTH) };
+            for block in 0..4 {
+                unsafe { _mm512_storeu_ps(destination.add(block * 16), accumulators[row][block]) };
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -178,10 +191,10 @@ mod tests {
             .collect::<Vec<_>>();
         let prepared = PreparedLinearF32::try_new(&weight, k, n).expect("DA3 shape");
         assert_eq!(prepared.packed.len(), weight.len());
-        for panel in [0, 3, 23] {
+        for panel in [0, 3, 11] {
             let packed = prepared.packed_panel(panel);
             for input in [0, 7, 511, 767] {
-                for lane in [0, 15, 31] {
+                for lane in [0, 15, 31, 63] {
                     assert_eq!(
                         packed[input * PANEL_WIDTH + lane].to_bits(),
                         weight[input * n + panel * PANEL_WIDTH + lane].to_bits()
