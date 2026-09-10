@@ -92,6 +92,44 @@ impl PreparedLinearF32 {
         }
     }
 
+    /// Computes DA3-BASE QKV directly into the head-major buffers consumed by
+    /// attention using this model-owned `[panel][K][64]` weight packing.
+    ///
+    /// The existing direct QKV route already uses a six-row, 64-column panel
+    /// schedule and writes HND output without a token-major staging tensor.
+    /// This exact-order alternative changes only the immutable weight address:
+    /// successive K values of one panel become contiguous rather than being
+    /// separated by the full 2304-column source row stride.
+    pub fn run_qkv_da3_base(
+        &self,
+        input: &[f32],
+        bias: &[f32],
+        q: &mut [f32],
+        k: &mut [f32],
+        v: &mut [f32],
+    ) -> bool {
+        let tokens = DA3_BASE_TOKENS_504X336;
+        if std::env::var_os("DA3_KERNELS_DISABLE_PACKED_QKV").is_some()
+            || self.input_features != 768
+            || self.output_features != 2304
+            || input.len() != tokens * 768
+            || bias.len() != 2304
+            || q.len() != tokens * 768
+            || k.len() != q.len()
+            || v.len() != q.len()
+        {
+            return false;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: fixed DA3-BASE dimensions, output lengths and ISA were
+            // validated above; the packed layout was created by `try_new`.
+            unsafe { run_qkv_da3_base_packed_avx512(self, input, bias, q, k, v) };
+            return true;
+        }
+        false
+    }
+
     /// Executes an AVX-512 F32 projection at the locked DA3-BASE token count.
     ///
     /// Returns `false` without changing `output` when the host or input shape
@@ -283,6 +321,82 @@ fn is_da3_base_projection_shape(input_features: usize, output_features: usize) -
         (input_features, output_features),
         (128, 128) | (768, 2304) | (768, 768) | (768, 3072) | (3072, 768)
     )
+}
+
+/// Packed-weight counterpart to the production direct QKV kernel. The panel
+/// schedule, K-major FMA order, bias addition, and HND stores intentionally
+/// match the established column-split route exactly.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn run_qkv_da3_base_packed_avx512(
+    prepared: &PreparedLinearF32,
+    input: &[f32],
+    bias: &[f32],
+    q: &mut [f32],
+    k: &mut [f32],
+    v: &mut [f32],
+) {
+    use core::arch::x86_64::*;
+
+    const ROWS: usize = 6;
+    const TOKENS: usize = DA3_BASE_TOKENS_504X336;
+    const K: usize = 768;
+    const N: usize = 2304;
+    debug_assert_eq!(prepared.input_features, K);
+    debug_assert_eq!(prepared.output_features, N);
+    let q_ptr = q.as_mut_ptr() as usize;
+    let k_ptr = k.as_mut_ptr() as usize;
+    let v_ptr = v.as_mut_ptr() as usize;
+
+    // One panel is one Q, K or V attention head. Every task writes a
+    // disjoint HND region, while the packed K-major panel remains contiguous
+    // across all 145 row tiles it serves.
+    (0..N / PANEL_WIDTH).into_par_iter().for_each(|panel| {
+        let col0 = panel * PANEL_WIDTH;
+        let group = col0 / 768;
+        let head = (col0 % 768) / PANEL_WIDTH;
+        let destination = match group {
+            0 => q_ptr,
+            1 => k_ptr,
+            _ => v_ptr,
+        } as *mut f32;
+        let weight_panel = &prepared.packed[panel * K * PANEL_WIDTH..(panel + 1) * K * PANEL_WIDTH];
+
+        for row0 in (0..TOKENS).step_by(ROWS) {
+            let rows = (TOKENS - row0).min(ROWS);
+            let mut accumulators = [[_mm512_setzero_ps(); 4]; ROWS];
+            for input_feature in 0..K {
+                let weights = unsafe { weight_panel.as_ptr().add(input_feature * PANEL_WIDTH) };
+                let vectors = unsafe {
+                    [
+                        _mm512_loadu_ps(weights),
+                        _mm512_loadu_ps(weights.add(16)),
+                        _mm512_loadu_ps(weights.add(32)),
+                        _mm512_loadu_ps(weights.add(48)),
+                    ]
+                };
+                for row in 0..rows {
+                    let activation = _mm512_set1_ps(input[(row0 + row) * K + input_feature]);
+                    for block in 0..4 {
+                        accumulators[row][block] =
+                            _mm512_fmadd_ps(activation, vectors[block], accumulators[row][block]);
+                    }
+                }
+            }
+            for row in 0..rows {
+                let output = unsafe { destination.add((head * TOKENS + row0 + row) * PANEL_WIDTH) };
+                for block in 0..4 {
+                    let bias_v = unsafe { _mm512_loadu_ps(bias.as_ptr().add(col0 + block * 16)) };
+                    unsafe {
+                        _mm512_storeu_ps(
+                            output.add(block * 16),
+                            _mm512_add_ps(accumulators[row][block], bias_v),
+                        );
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -533,6 +647,75 @@ mod tests {
                 ));
             }
             assert_eq!(validated_accumulated, whole);
+        }
+    }
+
+    #[test]
+    fn packed_qkv_matches_direct_qkv_bitwise_for_every_hnd_value() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("fma") {
+                return;
+            }
+            let tokens = DA3_BASE_TOKENS_504X336;
+            let input = (0..tokens * 768)
+                .map(|index| ((index % 113) as f32 - 56.0) * 0.003_906_25)
+                .collect::<Vec<_>>();
+            let weight = (0..768 * 2304)
+                .map(|index| ((index % 71) as f32 - 35.0) * 0.001_953_125)
+                .collect::<Vec<_>>();
+            let bias = (0..2304)
+                .map(|index| ((index % 29) as f32 - 14.0) * 0.007_812_5)
+                .collect::<Vec<_>>();
+            let prepared =
+                PreparedLinearF32::try_new(&weight, 768, 2304).expect("DA3 QKV shape is accepted");
+            let mut direct_q = vec![f32::NAN; tokens * 768];
+            let mut direct_k = vec![f32::NAN; tokens * 768];
+            let mut direct_v = vec![f32::NAN; tokens * 768];
+            let mut packed_q = vec![f32::NAN; tokens * 768];
+            let mut packed_k = vec![f32::NAN; tokens * 768];
+            let mut packed_v = vec![f32::NAN; tokens * 768];
+
+            assert!(crate::specialized::qkv_f32_da3_base(
+                &input,
+                &weight,
+                &bias,
+                &mut direct_q,
+                &mut direct_k,
+                &mut direct_v,
+            ));
+            assert!(prepared.run_qkv_da3_base(
+                &input,
+                &bias,
+                &mut packed_q,
+                &mut packed_k,
+                &mut packed_v,
+            ));
+            assert_eq!(packed_q, direct_q);
+            assert_eq!(packed_k, direct_k);
+            assert_eq!(packed_v, direct_v);
+
+            // Run a distinct second input through the same packed model to
+            // catch stale HND output or state retained across calls.
+            let alternate_input = input.iter().map(|value| -*value).collect::<Vec<_>>();
+            assert!(crate::specialized::qkv_f32_da3_base(
+                &alternate_input,
+                &weight,
+                &bias,
+                &mut direct_q,
+                &mut direct_k,
+                &mut direct_v,
+            ));
+            assert!(prepared.run_qkv_da3_base(
+                &alternate_input,
+                &bias,
+                &mut packed_q,
+                &mut packed_k,
+                &mut packed_v,
+            ));
+            assert_eq!(packed_q, direct_q);
+            assert_eq!(packed_k, direct_k);
+            assert_eq!(packed_v, direct_v);
         }
     }
 }
