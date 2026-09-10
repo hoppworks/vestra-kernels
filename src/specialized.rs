@@ -783,6 +783,14 @@ unsafe fn winograd_f2_blocked_avx512(
         unsafe { winograd_f2_blocked_avx512_out1_128x64_tiles4(u, v, m) };
         return;
     }
+    if tiles == 8
+        && input_channels == 64
+        && output_channels == 32
+        && std::env::var_os("DA3_KERNELS_ENABLE_OUT2A_F2_64X32_TILES8").is_some()
+    {
+        unsafe { winograd_f2_blocked_avx512_out2a_64x32_tiles8(u, v, m) };
+        return;
+    }
     // Keep the historically rejected all-convolution variant opt-in, but
     // allow the exact 64->32 final DPT head product to be isolated: it has
     // only two output ZMMs and can behave differently from the wider layers.
@@ -797,6 +805,41 @@ unsafe fn winograd_f2_blocked_avx512(
         unsafe {
             winograd_f2_blocked_avx512_generic(u, v, m, input_channels, output_channels, tiles)
         };
+    }
+}
+
+/// Exact DA3-BASE final-output product for an eight-tile F(2) block. The
+/// generic path stores its eight accumulators in an indexed array; keeping
+/// them named lets the compiler keep the hot register schedule explicit.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn winograd_f2_blocked_avx512_out2a_64x32_tiles8(u: &[f32], v: &[f32], m: &mut [f32]) {
+    use core::arch::x86_64::*;
+    const INPUTS: usize = 64;
+    const OUTPUTS: usize = 32;
+    const TILES: usize = 8;
+    for position in 0..16 {
+        let up = unsafe { u.as_ptr().add(position * INPUTS * OUTPUTS) };
+        let vp = unsafe { v.as_ptr().add(position * INPUTS * TILES) };
+        let mp = unsafe { m.as_mut_ptr().add(position * TILES * OUTPUTS) };
+        for output0 in (0..OUTPUTS).step_by(16) {
+            let mut a = [_mm512_setzero_ps(); TILES];
+            for input in 0..INPUTS {
+                let f = unsafe { _mm512_loadu_ps(up.add(input * OUTPUTS + output0)) };
+                let values = unsafe { vp.add(input * TILES) };
+                a[0] = _mm512_fmadd_ps(f, _mm512_set1_ps(unsafe { *values }), a[0]);
+                a[1] = _mm512_fmadd_ps(f, _mm512_set1_ps(unsafe { *values.add(1) }), a[1]);
+                a[2] = _mm512_fmadd_ps(f, _mm512_set1_ps(unsafe { *values.add(2) }), a[2]);
+                a[3] = _mm512_fmadd_ps(f, _mm512_set1_ps(unsafe { *values.add(3) }), a[3]);
+                a[4] = _mm512_fmadd_ps(f, _mm512_set1_ps(unsafe { *values.add(4) }), a[4]);
+                a[5] = _mm512_fmadd_ps(f, _mm512_set1_ps(unsafe { *values.add(5) }), a[5]);
+                a[6] = _mm512_fmadd_ps(f, _mm512_set1_ps(unsafe { *values.add(6) }), a[6]);
+                a[7] = _mm512_fmadd_ps(f, _mm512_set1_ps(unsafe { *values.add(7) }), a[7]);
+            }
+            for tile in 0..TILES {
+                unsafe { _mm512_storeu_ps(mp.add(tile * OUTPUTS + output0), a[tile]) };
+            }
+        }
     }
 }
 
