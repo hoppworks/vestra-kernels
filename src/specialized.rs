@@ -1650,7 +1650,6 @@ const FLASH_QUERY_TILE: usize = 8;
 #[cfg(target_arch = "x86_64")]
 struct FlashProfile {
     enabled: bool,
-    fast_exp: bool,
     k_pack_ns: AtomicU64,
     qk_gemm_ns: AtomicU64,
     softmax_ns: AtomicU64,
@@ -1662,10 +1661,6 @@ impl FlashProfile {
     fn from_env() -> Self {
         Self {
             enabled: std::env::var_os("DA3_FLASH_PROFILE").is_some(),
-            // Opt-in A/B path. It keeps the same range reduction and F32
-            // arithmetic shape but omits the two smallest polynomial terms.
-            // The full Cephes polynomial remains the production default.
-            fast_exp: std::env::var_os("DA3_KERNELS_FLASH_FAST_EXP4").is_some(),
             k_pack_ns: AtomicU64::new(0),
             qk_gemm_ns: AtomicU64::new(0),
             softmax_ns: AtomicU64::new(0),
@@ -1839,7 +1834,7 @@ unsafe fn flash_attention_tile_avx512<const QT: usize>(
             }
             let score_row = &mut scores[row];
             // SAFETY: every score row is the fixed 64-key tile.
-            unsafe { exp_64_avx512(score_row, profile.fast_exp) };
+            unsafe { exp_64_avx512(score_row) };
             for value in &score_row[..cols] {
                 sums[row] += *value;
             }
@@ -1972,7 +1967,7 @@ unsafe fn flash_attention_tile_packed_8x32_avx512(
             for value in &mut scores[row][..cols] {
                 *value -= new_max;
             }
-            unsafe { exp_64_avx512(&mut scores[row], profile.fast_exp) };
+            unsafe { exp_64_avx512(&mut scores[row]) };
             for value in &scores[row][..cols] {
                 sums[row] += *value;
             }
@@ -2077,7 +2072,7 @@ unsafe fn flash_attention_ggml64_tile_avx512(
             for score in &mut scores[row][..cols] {
                 *score -= new_max;
             }
-            unsafe { exp_64_avx512(&mut scores[row], profile.fast_exp) };
+            unsafe { exp_64_avx512(&mut scores[row]) };
             for score in &scores[row][..cols] {
                 sums[row] += *score;
             }
@@ -2191,7 +2186,7 @@ unsafe fn flash_attention_superblock32_avx512(
                 for value in &mut scores[row][..cols] {
                     *value -= new_max;
                 }
-                unsafe { exp_64_avx512(&mut scores[row], profile.fast_exp) };
+                unsafe { exp_64_avx512(&mut scores[row]) };
                 for value in &scores[row][..cols] {
                     sums[sub][row] += *value;
                 }
@@ -3029,7 +3024,7 @@ unsafe fn gemm_6x64_accumulate(m: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
 /// the hot softmax portion run as exactly four ZMM operations.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,fma")]
-unsafe fn exp_64_avx512(values: &mut [f32; 64], fast_exp4: bool) {
+unsafe fn exp_64_avx512(values: &mut [f32; 64]) {
     use core::arch::x86_64::*;
     let hi = _mm512_set1_ps(88.376_26);
     let lo = _mm512_set1_ps(-88.376_26);
@@ -3056,23 +3051,10 @@ unsafe fn exp_64_avx512(values: &mut [f32; 64], fast_exp4: bool) {
         let fx = _mm512_mask_sub_ps(trunc, gt, trunc, one);
         let x = _mm512_fnmadd_ps(fx, ln2_lo, _mm512_fnmadd_ps(fx, ln2_hi, x));
         let z = _mm512_mul_ps(x, x);
-        let mut y = if fast_exp4 {
-            // On the reduced [-ln(2)/2, ln(2)/2] interval, the omitted
-            // x^5 and x^6 terms are below 2.2e-5. This candidate saves two
-            // vector FMAs per score vector; model-level parity remains the
-            // admission authority.
-            let mut reduced = p[2];
-            for coefficient in &p[3..] {
-                reduced = _mm512_fmadd_ps(reduced, x, *coefficient);
-            }
-            reduced
-        } else {
-            let mut full = p[0];
-            for coefficient in &p[1..] {
-                full = _mm512_fmadd_ps(full, x, *coefficient);
-            }
-            full
-        };
+        let mut y = p[0];
+        for coefficient in &p[1..] {
+            y = _mm512_fmadd_ps(y, x, *coefficient);
+        }
         y = _mm512_fmadd_ps(y, z, x);
         let exponent = _mm512_slli_epi32(
             _mm512_add_epi32(_mm512_cvttps_epi32(fx), _mm512_set1_epi32(0x7f)),
@@ -3091,29 +3073,6 @@ unsafe fn exp_64_avx512(values: &mut [f32; 64], fast_exp4: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fast_exp4_stays_within_small_relative_error_of_full_polynomial() {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("fma") {
-                return;
-            }
-            let mut full = std::array::from_fn(|index| -8.0 + index as f32 * (8.0 / 63.0));
-            let mut fast = full;
-            // SAFETY: the test establishes the AVX-512/FMA requirement.
-            unsafe {
-                exp_64_avx512(&mut full, false);
-                exp_64_avx512(&mut fast, true);
-            }
-            for (candidate, reference) in fast.into_iter().zip(full) {
-                assert!(
-                    (candidate - reference).abs() / reference.max(f32::MIN_POSITIVE) < 3e-5,
-                    "candidate={candidate}, reference={reference}"
-                );
-            }
-        }
-    }
 
     #[test]
     fn linear_row_selector_accepts_only_explicit_ab_variants() {
