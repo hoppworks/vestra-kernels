@@ -8,7 +8,7 @@ repository = "https://github.com/hoppworks/vestra-kernels"
 
 [dependencies]
 cudarc = { version = "0.19.9", default-features = false, features = ["driver", "dynamic-loading", "cuda-12000", "nvrtc", "cublas"], optional = true }
-faer = "0.19"
+faer = "0.24"
 half = "2"
 rayon = "1.10"
 thiserror = "2"
