@@ -1708,9 +1708,7 @@ unsafe fn conv_transpose_lateral_composed_oc16_avx512(
                                 // from the import list because the intrinsic's
                                 // fully qualified spelling makes the scalar
                                 // broadcast contract unmistakable here.
-                                let values = unsafe {
-                                    std::arch::x86_64::_mm512_set1_ps(input[input_index])
-                                };
+                                let values = std::arch::x86_64::_mm512_set1_ps(input[input_index]);
                                 let coefficients = unsafe {
                                     _mm512_loadu_ps(
                                         filter
@@ -1719,7 +1717,7 @@ unsafe fn conv_transpose_lateral_composed_oc16_avx512(
                                             .add(weights + input_channel * 16),
                                     )
                                 };
-                                acc = unsafe { _mm512_fmadd_ps(values, coefficients, acc) };
+                                acc = _mm512_fmadd_ps(values, coefficients, acc);
                             }
                         }
                     }
