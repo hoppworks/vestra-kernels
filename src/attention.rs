@@ -76,6 +76,9 @@ pub fn attention(
     assert_eq!(k.len(), heads * n * head_dim);
     assert_eq!(v.len(), heads * n * head_dim);
     assert_eq!(out.len(), heads * n * head_dim);
+    if head_dim == 64 && crate::specialized::blis_attention_f32_da3_base(q, k, v, heads, n, out) {
+        return;
+    }
     if head_dim == 64 && crate::specialized::flash_attention_f32_da3_base(q, k, v, heads, n, out) {
         return;
     }
