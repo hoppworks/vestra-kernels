@@ -693,7 +693,8 @@ pub fn winograd_f2_blocked_f32(
 pub fn winograd_f2_blocked_rn1_128x128_tiles4_f32(u: &[f32], v: &[f32], m: &mut [f32]) -> bool {
     const CHANNELS: usize = 128;
     const TILES: usize = 4;
-    if std::env::var_os("DA3_RN1_F2_OC32").is_none()
+    let oc64 = std::env::var_os("DA3_RN1_F2_OC64").is_some();
+    if (!oc64 && std::env::var_os("DA3_RN1_F2_OC32").is_none())
         || std::env::var_os("DA3_KERNELS_DISABLE_WINO").is_some()
         || u.len() != 16 * CHANNELS * CHANNELS
         || v.len() != 16 * CHANNELS * TILES
@@ -705,7 +706,13 @@ pub fn winograd_f2_blocked_rn1_128x128_tiles4_f32(u: &[f32], v: &[f32], m: &mut 
     if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
         // SAFETY: the exact rn1 product layout and required ISA are checked
         // above. Each output vector belongs to one independent tile/channel.
-        unsafe { winograd_f2_blocked_avx512_rn1_128x128_tiles4(u, v, m) };
+        unsafe {
+            if oc64 {
+                winograd_f2_blocked_avx512_rn1_128x128_tiles4_oc64(u, v, m);
+            } else {
+                winograd_f2_blocked_avx512_rn1_128x128_tiles4(u, v, m);
+            }
+        };
         return true;
     }
     false
@@ -914,6 +921,65 @@ unsafe fn winograd_f2_blocked_avx512_rn1_128x128_tiles4(u: &[f32], v: &[f32], m:
                 _mm512_storeu_ps(m_position.add(2 * CHANNELS + output0 + 16), a12);
                 _mm512_storeu_ps(m_position.add(3 * CHANNELS + output0), a03);
                 _mm512_storeu_ps(m_position.add(3 * CHANNELS + output0 + 16), a13);
+            }
+        }
+    }
+}
+
+/// Opt-in OC64 counterpart to the accepted rn1 OC32 product. Four OC16
+/// vectors share the same four transformed activations. Each accumulator still
+/// visits input channels in ascending order, so this changes no reduction
+/// order; it only raises the register blocking from eight to sixteen vectors.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn winograd_f2_blocked_avx512_rn1_128x128_tiles4_oc64(u: &[f32], v: &[f32], m: &mut [f32]) {
+    use core::arch::x86_64::*;
+    const CHANNELS: usize = 128;
+    const TILES: usize = 4;
+    for position in 0..16 {
+        let u_position = unsafe { u.as_ptr().add(position * CHANNELS * CHANNELS) };
+        let v_position = unsafe { v.as_ptr().add(position * CHANNELS * TILES) };
+        let m_position = unsafe { m.as_mut_ptr().add(position * TILES * CHANNELS) };
+        for output0 in (0..CHANNELS).step_by(64) {
+            let mut accumulators = [[_mm512_setzero_ps(); TILES]; 4];
+            for input in 0..CHANNELS {
+                let filter = unsafe { u_position.add(input * CHANNELS + output0) };
+                let filters = unsafe {
+                    [
+                        _mm512_loadu_ps(filter),
+                        _mm512_loadu_ps(filter.add(16)),
+                        _mm512_loadu_ps(filter.add(32)),
+                        _mm512_loadu_ps(filter.add(48)),
+                    ]
+                };
+                let values = unsafe { v_position.add(input * TILES) };
+                let values = unsafe {
+                    [
+                        _mm512_set1_ps(*values),
+                        _mm512_set1_ps(*values.add(1)),
+                        _mm512_set1_ps(*values.add(2)),
+                        _mm512_set1_ps(*values.add(3)),
+                    ]
+                };
+                for output_block in 0..4 {
+                    for tile in 0..TILES {
+                        accumulators[output_block][tile] = _mm512_fmadd_ps(
+                            filters[output_block],
+                            values[tile],
+                            accumulators[output_block][tile],
+                        );
+                    }
+                }
+            }
+            for tile in 0..TILES {
+                for output_block in 0..4 {
+                    unsafe {
+                        _mm512_storeu_ps(
+                            m_position.add(tile * CHANNELS + output0 + output_block * 16),
+                            accumulators[output_block][tile],
+                        );
+                    }
+                }
             }
         }
     }
@@ -3131,7 +3197,7 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn rn1_oc32_product_matches_generic_f2_bitwise() {
+    fn rn1_oc32_and_oc64_products_match_generic_f2_bitwise() {
         if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("fma") {
             return;
         }
@@ -3144,7 +3210,8 @@ mod tests {
             .map(|index| ((index % 61) as f32 - 30.0) * 0.007_812_5)
             .collect::<Vec<_>>();
         let mut generic = vec![f32::NAN; 16 * TILES * CHANNELS];
-        let mut rn1 = vec![f32::NAN; generic.len()];
+        let mut oc32 = vec![f32::NAN; generic.len()];
+        let mut oc64 = vec![f32::NAN; generic.len()];
         assert!(winograd_f2_blocked_f32(
             &u,
             &v,
@@ -3154,11 +3221,22 @@ mod tests {
             TILES,
         ));
         unsafe { std::env::set_var("DA3_RN1_F2_OC32", "1") };
-        let used = winograd_f2_blocked_rn1_128x128_tiles4_f32(&u, &v, &mut rn1);
+        let used = winograd_f2_blocked_rn1_128x128_tiles4_f32(&u, &v, &mut oc32);
         unsafe { std::env::remove_var("DA3_RN1_F2_OC32") };
         assert!(used);
         assert_eq!(
-            rn1.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            oc32.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            generic
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+        );
+        unsafe { std::env::set_var("DA3_RN1_F2_OC64", "1") };
+        let used = winograd_f2_blocked_rn1_128x128_tiles4_f32(&u, &v, &mut oc64);
+        unsafe { std::env::remove_var("DA3_RN1_F2_OC64") };
+        assert!(used);
+        assert_eq!(
+            oc64.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
             generic
                 .iter()
                 .map(|value| value.to_bits())
