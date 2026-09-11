@@ -810,6 +810,25 @@ unsafe fn winograd_f2_blocked_avx512(
         unsafe { winograd_f2_blocked_avx512_out1_128x64_tiles4(u, v, m) };
         return;
     }
+    if tiles == 4
+        && output_channels == 128
+        && std::env::var_os("DA3_KERNELS_LATERAL_F2_STATIC").is_some()
+    {
+        // The four DPT lateral projections are the only production F(2)
+        // products with these exact input widths. Keeping the bounds static
+        // removes their dynamic channel/tile bookkeeping while preserving the
+        // generic kernel's position -> output-panel -> input FMA order.
+        match input_channels {
+            96 => unsafe { winograd_f2_blocked_avx512_lateral_tiles4::<96>(u, v, m) },
+            192 => unsafe { winograd_f2_blocked_avx512_lateral_tiles4::<192>(u, v, m) },
+            384 => unsafe { winograd_f2_blocked_avx512_lateral_tiles4::<384>(u, v, m) },
+            768 => unsafe { winograd_f2_blocked_avx512_lateral_tiles4::<768>(u, v, m) },
+            _ => unsafe {
+                winograd_f2_blocked_avx512_generic(u, v, m, input_channels, output_channels, tiles)
+            },
+        }
+        return;
+    }
     // Keep the historically rejected all-convolution variant opt-in, but
     // allow the exact 64->32 final DPT head product to be isolated: it has
     // only two output ZMMs and can behave differently from the wider layers.
@@ -914,6 +933,47 @@ unsafe fn winograd_f2_blocked_avx512_rn1_128x128_tiles4(u: &[f32], v: &[f32], m:
                 _mm512_storeu_ps(m_position.add(2 * CHANNELS + output0 + 16), a12);
                 _mm512_storeu_ps(m_position.add(3 * CHANNELS + output0), a03);
                 _mm512_storeu_ps(m_position.add(3 * CHANNELS + output0 + 16), a13);
+            }
+        }
+    }
+}
+
+/// Fixed-width counterpart to the generic F(2) product for DPT's lateral
+/// 96/192/384/768 -> 128 projections.  The output tile remains four lanes of
+/// 16 channels, so no register-pressure trade-off is introduced.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn winograd_f2_blocked_avx512_lateral_tiles4<const INPUTS: usize>(
+    u: &[f32],
+    v: &[f32],
+    m: &mut [f32],
+) {
+    use core::arch::x86_64::*;
+
+    const OUTPUTS: usize = 128;
+    const TILES: usize = 4;
+    for position in 0..16 {
+        let u_position = unsafe { u.as_ptr().add(position * INPUTS * OUTPUTS) };
+        let v_position = unsafe { v.as_ptr().add(position * INPUTS * TILES) };
+        let m_position = unsafe { m.as_mut_ptr().add(position * TILES * OUTPUTS) };
+        for output0 in (0..OUTPUTS).step_by(16) {
+            let mut a0 = _mm512_setzero_ps();
+            let mut a1 = _mm512_setzero_ps();
+            let mut a2 = _mm512_setzero_ps();
+            let mut a3 = _mm512_setzero_ps();
+            for input in 0..INPUTS {
+                let filter = unsafe { _mm512_loadu_ps(u_position.add(input * OUTPUTS + output0)) };
+                let values = unsafe { v_position.add(input * TILES) };
+                a0 = _mm512_fmadd_ps(filter, _mm512_set1_ps(unsafe { *values }), a0);
+                a1 = _mm512_fmadd_ps(filter, _mm512_set1_ps(unsafe { *values.add(1) }), a1);
+                a2 = _mm512_fmadd_ps(filter, _mm512_set1_ps(unsafe { *values.add(2) }), a2);
+                a3 = _mm512_fmadd_ps(filter, _mm512_set1_ps(unsafe { *values.add(3) }), a3);
+            }
+            unsafe {
+                _mm512_storeu_ps(m_position.add(output0), a0);
+                _mm512_storeu_ps(m_position.add(OUTPUTS + output0), a1);
+                _mm512_storeu_ps(m_position.add(2 * OUTPUTS + output0), a2);
+                _mm512_storeu_ps(m_position.add(3 * OUTPUTS + output0), a3);
             }
         }
     }
@@ -3164,6 +3224,63 @@ mod tests {
                 .map(|value| value.to_bits())
                 .collect::<Vec<_>>(),
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn lateral_static_tiles4_matches_generic_for_every_dpt_width() {
+        if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+        const OUTPUTS: usize = 128;
+        const TILES: usize = 4;
+        for inputs in [96usize, 192, 384, 768] {
+            let u = (0..16 * inputs * OUTPUTS)
+                .map(|index| ((index % 37) as f32 - 18.0) * 0.001953125)
+                .collect::<Vec<_>>();
+            let v = (0..16 * inputs * TILES)
+                .map(|index| ((index % 29) as f32 - 14.0) * 0.0078125)
+                .collect::<Vec<_>>();
+            let mut generic = vec![0.0; 16 * TILES * OUTPUTS];
+            let mut static_width = vec![0.0; generic.len()];
+            unsafe {
+                winograd_f2_blocked_avx512_generic(
+                    &u,
+                    &v,
+                    &mut generic,
+                    inputs,
+                    OUTPUTS,
+                    TILES,
+                );
+                match inputs {
+                    96 => winograd_f2_blocked_avx512_lateral_tiles4::<96>(
+                        &u,
+                        &v,
+                        &mut static_width,
+                    ),
+                    192 => winograd_f2_blocked_avx512_lateral_tiles4::<192>(
+                        &u,
+                        &v,
+                        &mut static_width,
+                    ),
+                    384 => winograd_f2_blocked_avx512_lateral_tiles4::<384>(
+                        &u,
+                        &v,
+                        &mut static_width,
+                    ),
+                    768 => winograd_f2_blocked_avx512_lateral_tiles4::<768>(
+                        &u,
+                        &v,
+                        &mut static_width,
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+            assert!(generic
+                .iter()
+                .zip(&static_width)
+                .all(|(control, candidate)| control.to_bits() == candidate.to_bits()));
+        }
     }
 
     #[test]
