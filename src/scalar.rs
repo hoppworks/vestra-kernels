@@ -82,21 +82,33 @@ pub fn add_bias_rows(x: &mut [f32], rows: usize, cols: usize, bias: &[f32]) {
 
 pub fn layernorm(x: &mut [f32], rows: usize, cols: usize, gamma: &[f32], beta: &[f32], eps: f32) {
     debug_assert_eq!(x.len(), rows * cols);
+    debug_assert_eq!(gamma.len(), cols);
+    debug_assert_eq!(beta.len(), cols);
     // Rows are independent and each keeps the exact scalar reduction order.
     // This is particularly important for Q/K normalization, which has over
     // ten thousand short rows per late DA3-BASE transformer block.
+    let use_avx512 = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::is_x86_feature_detected!("avx512f")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    };
     if rows >= 32 {
         x.par_chunks_mut(cols)
-            .for_each(|row| layernorm_row(row, gamma, beta, eps));
+            .for_each(|row| layernorm_row(row, gamma, beta, eps, use_avx512));
     } else {
         for row in x.chunks_mut(cols) {
-            layernorm_row(row, gamma, beta, eps);
+            layernorm_row(row, gamma, beta, eps, use_avx512);
         }
     }
 }
 
 #[inline]
-fn layernorm_row(row: &mut [f32], gamma: &[f32], beta: &[f32], eps: f32) {
+fn layernorm_row(row: &mut [f32], gamma: &[f32], beta: &[f32], eps: f32, use_avx512: bool) {
     let cols = row.len();
     let mean = row.iter().sum::<f32>() / cols as f32;
     let var = row
@@ -108,6 +120,16 @@ fn layernorm_row(row: &mut [f32], gamma: &[f32], beta: &[f32], eps: f32) {
         .sum::<f32>()
         / cols as f32;
     let inv = 1.0 / (var + eps).sqrt();
+    #[cfg(target_arch = "x86_64")]
+    if use_avx512 {
+        // SAFETY: the caller performed runtime ISA detection and all slices
+        // have the validated row width.
+        unsafe {
+            crate::simd_avx512::layernorm_affine_avx512(row, mean, inv, gamma, beta);
+        }
+        return;
+    }
+    let _ = use_avx512;
     for c in 0..cols {
         row[c] = (row[c] - mean) * inv * gamma[c] + beta[c];
     }
@@ -188,7 +210,7 @@ mod tests {
 
         layernorm(&mut parallel, rows, cols, &gamma, &beta, 1e-5);
         for row in sequential.chunks_mut(cols) {
-            layernorm_row(row, &gamma, &beta, 1e-5);
+            layernorm_row(row, &gamma, &beta, 1e-5, false);
         }
         assert_eq!(
             parallel
@@ -196,6 +218,37 @@ mod tests {
                 .map(|value| value.to_bits())
                 .collect::<Vec<_>>(),
             sequential
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn layernorm_simd_affine_keeps_scalar_reduction_bits() {
+        let rows = 37;
+        let cols = 768;
+        let gamma = (0..cols)
+            .map(|index| (index as f32 * 0.007).sin())
+            .collect::<Vec<_>>();
+        let beta = (0..cols)
+            .map(|index| (index as f32 * 0.011).cos())
+            .collect::<Vec<_>>();
+        let input = (0..rows * cols)
+            .map(|index| (index as f32 * 0.0031).sin() - 0.2)
+            .collect::<Vec<_>>();
+        let mut scalar = input.clone();
+        let mut dispatched = input;
+        for row in scalar.chunks_mut(cols) {
+            layernorm_row(row, &gamma, &beta, 1e-5, false);
+        }
+        layernorm(&mut dispatched, rows, cols, &gamma, &beta, 1e-5);
+        assert_eq!(
+            scalar
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            dispatched
                 .iter()
                 .map(|value| value.to_bits())
                 .collect::<Vec<_>>(),

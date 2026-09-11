@@ -85,6 +85,41 @@ pub(crate) unsafe fn exp_in_place_avx512(values: &mut [f32]) {
     }
 }
 
+/// Applies LayerNorm's already-reduced affine suffix to one row. Mean and
+/// inverse standard deviation deliberately remain caller-owned scalar values:
+/// this only vectorizes independent per-channel arithmetic and does not alter
+/// the reduction order.
+#[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub(crate) unsafe fn layernorm_affine_avx512(
+    row: &mut [f32],
+    mean: f32,
+    inv: f32,
+    gamma: &[f32],
+    beta: &[f32],
+) {
+    debug_assert_eq!(row.len(), gamma.len());
+    debug_assert_eq!(row.len(), beta.len());
+    let mean_v = _mm512_set1_ps(mean);
+    let inv_v = _mm512_set1_ps(inv);
+    let main = row.len() - (row.len() % LANES);
+    let mut channel = 0;
+    while channel < main {
+        let row_ptr = row.as_mut_ptr().add(channel);
+        let centered = _mm512_sub_ps(_mm512_loadu_ps(row_ptr), mean_v);
+        let normalized = _mm512_mul_ps(centered, inv_v);
+        let scaled = _mm512_mul_ps(normalized, _mm512_loadu_ps(gamma.as_ptr().add(channel)));
+        _mm512_storeu_ps(
+            row_ptr,
+            _mm512_add_ps(scaled, _mm512_loadu_ps(beta.as_ptr().add(channel))),
+        );
+        channel += LANES;
+    }
+    for channel in main..row.len() {
+        row[channel] = (row[channel] - mean) * inv * gamma[channel] + beta[channel];
+    }
+}
+
 /// AVX-512 dot product. The final scalar reduction intentionally keeps the
 /// result in F32 and avoids FMA; callers still validate full-model parity.
 #[inline]
