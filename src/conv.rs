@@ -1120,9 +1120,7 @@ fn conv3x3_winograd_f2_impl(
                 // 128->128 convolutions at this exact spatial geometry. Its
                 // opt-in product kernel retains the generic FMA order while
                 // pairing two OC16 panels to reuse broadcasts.
-                let rn1_product = (std::env::var_os("DA3_RN1_F2_OC32").is_some()
-                    || std::env::var_os("DA3_RN1_F2_OC64").is_some())
-                    && relu_input
+                let rn1_product = relu_input
                     && in_c == 128
                     && out_c == 128
                     && active == 4
