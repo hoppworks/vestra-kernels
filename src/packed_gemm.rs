@@ -309,6 +309,77 @@ impl PreparedLinearF32 {
         }
     }
 
+    /// Adds four consecutive 64-wide input strips to every output panel in
+    /// one output-tile residency window.
+    ///
+    /// Every output lane still observes the exact same FMA sequence as four
+    /// calls to [`Self::accumulate_input_panel_rows_serial`]: strip 0 through
+    /// strip 3, then each strip's 64 hidden channels in ascending order. The
+    /// difference is solely that the output partial sum is loaded and stored
+    /// once for the four strips instead of once per strip.
+    pub fn accumulate_four_input_panels_rows_serial(
+        &self,
+        inputs: [&[f32]; 4],
+        output: &mut [f32],
+        first_input_panel: usize,
+    ) -> bool {
+        let rows = inputs[0].len() / PANEL_WIDTH;
+        if std::env::var_os("DA3_KERNELS_DISABLE_PACKED_LINEAR").is_some()
+            || self.input_features % PANEL_WIDTH != 0
+            || rows == 0
+            || rows > ROW_TILE
+            || inputs.iter().any(|input| input.len() != rows * PANEL_WIDTH)
+            || output.len() != rows * self.output_features
+            || first_input_panel + 4 > self.input_features / PANEL_WIDTH
+        {
+            return false;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: shape, ISA and four consecutive packed K strips were
+            // checked above.
+            unsafe {
+                accumulate_four_input_panels_rows_avx512(self, inputs, output, first_input_panel)
+            };
+            return true;
+        }
+        false
+    }
+
+    /// Unchecked hot-path companion to
+    /// [`Self::accumulate_four_input_panels_rows_serial`].
+    ///
+    /// The executor must first snapshot [`Self::serial_panel_kernel_available`]
+    /// and retain the fixed DA3-BASE shape contract for its lifetime.
+    pub fn accumulate_four_input_panels_rows_serial_validated(
+        &self,
+        inputs: [&[f32]; 4],
+        output: &mut [f32],
+        first_input_panel: usize,
+    ) -> bool {
+        debug_assert!(self.serial_panel_kernel_available());
+        let rows = inputs[0].len() / PANEL_WIDTH;
+        debug_assert!(self.input_features % PANEL_WIDTH == 0);
+        debug_assert!(rows > 0 && rows <= ROW_TILE);
+        debug_assert!(inputs.iter().all(|input| input.len() == rows * PANEL_WIDTH));
+        debug_assert_eq!(output.len(), rows * self.output_features);
+        debug_assert!(first_input_panel + 4 <= self.input_features / PANEL_WIDTH);
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: availability and the fixed serial panel contract are
+            // validated by the executor before this hot path is selected.
+            unsafe {
+                accumulate_four_input_panels_rows_avx512(self, inputs, output, first_input_panel)
+            };
+            true
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (inputs, output, first_input_panel);
+            false
+        }
+    }
+
     #[cfg(test)]
     fn packed_panel(&self, panel: usize) -> &[f32] {
         &self.packed[panel * self.input_features * PANEL_WIDTH
@@ -534,6 +605,68 @@ unsafe fn accumulate_input_panel_rows_avx512(
     }
 }
 
+/// Four-panel FC2 variant that retains a 6x64 output tile while consuming
+/// four consecutive hidden strips. The strip loop is deliberately inside the
+/// output-panel loop so each output partial sum is materialized only once.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn accumulate_four_input_panels_rows_avx512(
+    prepared: &PreparedLinearF32,
+    inputs: [&[f32]; 4],
+    output: &mut [f32],
+    first_input_panel: usize,
+) {
+    use core::arch::x86_64::*;
+
+    let n = prepared.output_features;
+    let rows = inputs[0].len() / PANEL_WIDTH;
+    for output_panel in 0..n / PANEL_WIDTH {
+        let mut accumulators = [[_mm512_setzero_ps(); 4]; ROW_TILE];
+        for row in 0..rows {
+            let destination = unsafe { output.as_ptr().add(row * n + output_panel * PANEL_WIDTH) };
+            for block in 0..4 {
+                accumulators[row][block] = unsafe { _mm512_loadu_ps(destination.add(block * 16)) };
+            }
+        }
+        for (panel_offset, input) in inputs.iter().enumerate() {
+            let input_panel = first_input_panel + panel_offset;
+            let weights = &prepared.packed[(output_panel * prepared.input_features
+                + input_panel * PANEL_WIDTH)
+                * PANEL_WIDTH
+                ..(output_panel * prepared.input_features + (input_panel + 1) * PANEL_WIDTH)
+                    * PANEL_WIDTH];
+            for input_feature in 0..PANEL_WIDTH {
+                let weight = unsafe { weights.as_ptr().add(input_feature * PANEL_WIDTH) };
+                let vectors = unsafe {
+                    [
+                        _mm512_loadu_ps(weight),
+                        _mm512_loadu_ps(weight.add(16)),
+                        _mm512_loadu_ps(weight.add(32)),
+                        _mm512_loadu_ps(weight.add(48)),
+                    ]
+                };
+                for row in 0..rows {
+                    let value = _mm512_set1_ps(input[row * PANEL_WIDTH + input_feature]);
+                    for block in 0..4 {
+                        accumulators[row][block] =
+                            _mm512_fmadd_ps(value, vectors[block], accumulators[row][block]);
+                    }
+                }
+            }
+        }
+        for row in 0..rows {
+            let destination = unsafe {
+                output
+                    .as_mut_ptr()
+                    .add(row * n + output_panel * PANEL_WIDTH)
+            };
+            for block in 0..4 {
+                unsafe { _mm512_storeu_ps(destination.add(block * 16), accumulators[row][block]) };
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,6 +780,48 @@ mod tests {
                 ));
             }
             assert_eq!(validated_accumulated, whole);
+
+            let mut grouped_accumulated = vec![0.0; rows * n];
+            for group in 0..k / (4 * PANEL_WIDTH) {
+                let first_panel = group * 4;
+                let mut strips = std::array::from_fn(|_| vec![0.0; rows * PANEL_WIDTH]);
+                for (strip_offset, strip) in strips.iter_mut().enumerate() {
+                    let input_panel = first_panel + strip_offset;
+                    for row in 0..rows {
+                        strip[row * PANEL_WIDTH..(row + 1) * PANEL_WIDTH].copy_from_slice(
+                            &input[row * k + input_panel * PANEL_WIDTH
+                                ..row * k + (input_panel + 1) * PANEL_WIDTH],
+                        );
+                    }
+                }
+                assert!(prepared.accumulate_four_input_panels_rows_serial(
+                    [&strips[0], &strips[1], &strips[2], &strips[3]],
+                    &mut grouped_accumulated,
+                    first_panel,
+                ));
+            }
+            assert_eq!(grouped_accumulated, whole);
+
+            let mut validated_grouped_accumulated = vec![0.0; rows * n];
+            for group in 0..k / (4 * PANEL_WIDTH) {
+                let first_panel = group * 4;
+                let mut strips = std::array::from_fn(|_| vec![0.0; rows * PANEL_WIDTH]);
+                for (strip_offset, strip) in strips.iter_mut().enumerate() {
+                    let input_panel = first_panel + strip_offset;
+                    for row in 0..rows {
+                        strip[row * PANEL_WIDTH..(row + 1) * PANEL_WIDTH].copy_from_slice(
+                            &input[row * k + input_panel * PANEL_WIDTH
+                                ..row * k + (input_panel + 1) * PANEL_WIDTH],
+                        );
+                    }
+                }
+                assert!(prepared.accumulate_four_input_panels_rows_serial_validated(
+                    [&strips[0], &strips[1], &strips[2], &strips[3]],
+                    &mut validated_grouped_accumulated,
+                    first_panel,
+                ));
+            }
+            assert_eq!(validated_grouped_accumulated, whole);
         }
     }
 
