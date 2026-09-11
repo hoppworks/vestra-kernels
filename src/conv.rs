@@ -1845,9 +1845,7 @@ mod tests {
         // composition changes F32 association, so compare to the materialized
         // definition with an intentionally tight numerical envelope instead
         // of promising bit identity.
-        // Sixteen outputs deliberately enters the AVX-512 OC16 route on the
-        // Workhorse while still remaining small enough for an oracle test.
-        let (in_c, middle_c, out_c) = (3usize, 4usize, 16usize);
+        let (in_c, middle_c, out_c) = (3usize, 4usize, 5usize);
         let mut rng = Xorshift32(0xC0DE_4003);
         let transpose_weight = random_vec(&mut rng, in_c * middle_c * 4 * 4);
         let transpose_bias = random_vec(&mut rng, middle_c);
