@@ -784,7 +784,8 @@ mod tests {
             let mut grouped_accumulated = vec![0.0; rows * n];
             for group in 0..k / (4 * PANEL_WIDTH) {
                 let first_panel = group * 4;
-                let mut strips = std::array::from_fn(|_| vec![0.0; rows * PANEL_WIDTH]);
+                let mut strips: [Vec<f32>; 4] =
+                    std::array::from_fn(|_| vec![0.0; rows * PANEL_WIDTH]);
                 for (strip_offset, strip) in strips.iter_mut().enumerate() {
                     let input_panel = first_panel + strip_offset;
                     for row in 0..rows {
@@ -805,7 +806,8 @@ mod tests {
             let mut validated_grouped_accumulated = vec![0.0; rows * n];
             for group in 0..k / (4 * PANEL_WIDTH) {
                 let first_panel = group * 4;
-                let mut strips = std::array::from_fn(|_| vec![0.0; rows * PANEL_WIDTH]);
+                let mut strips: [Vec<f32>; 4] =
+                    std::array::from_fn(|_| vec![0.0; rows * PANEL_WIDTH]);
                 for (strip_offset, strip) in strips.iter_mut().enumerate() {
                     let input_panel = first_panel + strip_offset;
                     for row in 0..rows {
