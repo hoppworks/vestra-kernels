@@ -1379,11 +1379,6 @@ pub struct ComposedTransposeLateralF32 {
     // [output_channel][input_channel][6][6], where index (ky, kx) represents
     // the signed displacement (ky - 1, kx - 1) from one stride-4 input site.
     weights: Arc<[f32]>,
-    // [output_block][6][6][input_channel][lane]. This is the execution
-    // layout for the AVX-512 polyphase gather route: one FMA updates sixteen
-    // independent final lateral channels.
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    packed_oc16: Arc<[f32]>,
     // Original per-channel bias of the 4×4 transpose. Retaining this compact
     // form lets the execution route derive the exact spatial edge correction
     // for arbitrary (including tiny test) rectangles.
@@ -1391,12 +1386,6 @@ pub struct ComposedTransposeLateralF32 {
     // [output_channel][middle_channel][3][3], required only for the boundary
     // correction. It is immutable and model-owned like the composed weights.
     lateral_weights: Arc<[f32]>,
-    // [edge_class_y][edge_class_x][output_block][lane], where each edge
-    // class is top/interior/bottom or left/interior/right. It turns the
-    // spatially dependent resize-bias correction into one vector add per
-    // output pixel on normal (at least 2×2) rectangles.
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    edge_bias_oc16: Arc<[f32]>,
     input_channels: usize,
     middle_channels: usize,
     output_channels: usize,
@@ -1463,74 +1452,10 @@ pub fn prepare_composed_transpose_lateral_filter(
         }
     }
 
-    let output_blocks = output_channels.div_ceil(16);
-    let mut packed_oc16 = vec![0.0; output_blocks * 6 * 6 * input_channels * 16];
-    for output in 0..output_channels {
-        let output_block = output / 16;
-        let lane = output % 16;
-        for input in 0..input_channels {
-            for kernel_y in 0..6 {
-                for kernel_x in 0..6 {
-                    let source_index =
-                        (((output * input_channels + input) * 6 + kernel_y) * 6) + kernel_x;
-                    let packed_index =
-                        ((((output_block * 6 + kernel_y) * 6 + kernel_x) * input_channels + input)
-                            * 16)
-                            + lane;
-                    packed_oc16[packed_index] = weights[source_index];
-                }
-            }
-        }
-    }
-
-    let mut edge_bias_oc16 = vec![0.0; 3 * 3 * output_blocks * 16];
-    for edge_y in 0..3 {
-        for edge_x in 0..3 {
-            for output in 0..output_channels {
-                let mut correction = 0.0f32;
-                for middle in 0..middle_channels {
-                    for lateral_y in 0..3 {
-                        let y_visible = match edge_y {
-                            0 => lateral_y >= 1,
-                            1 => true,
-                            2 => lateral_y <= 1,
-                            _ => unreachable!(),
-                        };
-                        if !y_visible {
-                            continue;
-                        }
-                        for lateral_x in 0..3 {
-                            let x_visible = match edge_x {
-                                0 => lateral_x >= 1,
-                                1 => true,
-                                2 => lateral_x <= 1,
-                                _ => unreachable!(),
-                            };
-                            if !x_visible {
-                                continue;
-                            }
-                            let lateral_index =
-                                ((output * middle_channels + middle) * 3 + lateral_y) * 3
-                                    + lateral_x;
-                            correction += transpose_bias[middle] * lateral_weight[lateral_index];
-                        }
-                    }
-                }
-                let output_block = output / 16;
-                let lane = output % 16;
-                edge_bias_oc16
-                    [(((edge_y * 3 + edge_x) * output_blocks + output_block) * 16) + lane] =
-                    correction;
-            }
-        }
-    }
-
     ComposedTransposeLateralF32 {
         weights: weights.into(),
-        packed_oc16: packed_oc16.into(),
         transpose_bias: transpose_bias.to_vec().into(),
         lateral_weights: lateral_weight.to_vec().into(),
-        edge_bias_oc16: edge_bias_oc16.into(),
         input_channels,
         middle_channels,
         output_channels,
@@ -1556,19 +1481,6 @@ pub fn conv_transpose_lateral_composed(
     let oh = ih * 4;
     let ow = iw * 4;
     assert_eq!(out.len(), filter.output_channels * oh * ow);
-
-    #[cfg(target_arch = "x86_64")]
-    if filter.output_channels.is_multiple_of(16)
-        && ih >= 1
-        && iw >= 1
-        && std::is_x86_feature_detected!("avx512f")
-        && std::is_x86_feature_detected!("fma")
-    {
-        // SAFETY: the feature checks and the exact prepared-layout lengths
-        // above establish the AVX-512 kernel's contract.
-        unsafe { conv_transpose_lateral_composed_oc16_avx512(input, ih, iw, filter, out) };
-        return;
-    }
 
     out.par_chunks_mut(oh * ow)
         .enumerate()
@@ -1633,102 +1545,6 @@ pub fn conv_transpose_lateral_composed(
                         }
                     }
                     plane[oy * ow + ox] = acc;
-                }
-            }
-        });
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,fma")]
-unsafe fn conv_transpose_lateral_composed_oc16_avx512(
-    input: &[f32],
-    ih: usize,
-    iw: usize,
-    filter: &ComposedTransposeLateralF32,
-    out: &mut [f32],
-) {
-    use std::arch::x86_64::{_mm512_fmadd_ps, _mm512_loadu_ps, _mm512_storeu_ps};
-
-    let (oh, ow) = (ih * 4, iw * 4);
-    let pixels = oh * ow;
-    let output_blocks = filter.output_channels / 16;
-    debug_assert_eq!(
-        filter.packed_oc16.len(),
-        output_blocks * 6 * 6 * filter.input_channels * 16
-    );
-    debug_assert_eq!(filter.edge_bias_oc16.len(), 9 * output_blocks * 16);
-
-    out.par_chunks_mut(16 * pixels)
-        .enumerate()
-        .for_each(|(output_block, block_out)| {
-            for oy in 0..oh {
-                let edge_y = if oy == 0 {
-                    0
-                } else if oy + 1 == oh {
-                    2
-                } else {
-                    1
-                };
-                for ox in 0..ow {
-                    let edge_x = if ox == 0 {
-                        0
-                    } else if ox + 1 == ow {
-                        2
-                    } else {
-                        1
-                    };
-                    let bias_index = ((edge_y * 3 + edge_x) * output_blocks + output_block) * 16;
-                    // SAFETY: prepared edge bias has sixteen lanes per block.
-                    let mut acc =
-                        unsafe { _mm512_loadu_ps(filter.edge_bias_oc16.as_ptr().add(bias_index)) };
-                    for kernel_y in 0..6 {
-                        let numerator_y = oy as isize - (kernel_y as isize - 1);
-                        if numerator_y < 0 || numerator_y % 4 != 0 {
-                            continue;
-                        }
-                        let source_y = (numerator_y / 4) as usize;
-                        if source_y >= ih {
-                            continue;
-                        }
-                        for kernel_x in 0..6 {
-                            let numerator_x = ox as isize - (kernel_x as isize - 1);
-                            if numerator_x < 0 || numerator_x % 4 != 0 {
-                                continue;
-                            }
-                            let source_x = (numerator_x / 4) as usize;
-                            if source_x >= iw {
-                                continue;
-                            }
-                            let weights = (((output_block * 6 + kernel_y) * 6 + kernel_x)
-                                * filter.input_channels)
-                                * 16;
-                            for input_channel in 0..filter.input_channels {
-                                let input_index = (input_channel * ih + source_y) * iw + source_x;
-                                // `_mm512_set1_ps` is intentionally omitted
-                                // from the import list because the intrinsic's
-                                // fully qualified spelling makes the scalar
-                                // broadcast contract unmistakable here.
-                                let values = unsafe {
-                                    std::arch::x86_64::_mm512_set1_ps(input[input_index])
-                                };
-                                let coefficients = unsafe {
-                                    _mm512_loadu_ps(
-                                        filter
-                                            .packed_oc16
-                                            .as_ptr()
-                                            .add(weights + input_channel * 16),
-                                    )
-                                };
-                                acc = unsafe { _mm512_fmadd_ps(values, coefficients, acc) };
-                            }
-                        }
-                    }
-                    let mut lanes = [0.0f32; 16];
-                    unsafe { _mm512_storeu_ps(lanes.as_mut_ptr(), acc) };
-                    let pixel = oy * ow + ox;
-                    for lane in 0..16 {
-                        block_out[lane * pixels + pixel] = lanes[lane];
-                    }
                 }
             }
         });
