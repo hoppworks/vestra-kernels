@@ -50,8 +50,8 @@ cargo test --locked --all-targets
 cargo test --locked --lib --tests --features cuda
 ```
 
-The repository pins Rust 1.93.0 with rustfmt and Clippy, and CI runs the same
-commands on Linux. AVX-512 execution tests require compatible x86-64 hardware;
+The repository pins Rust 1.93.0 with rustfmt and Clippy. Run the commands
+locally; public GitHub Actions are not a published proof. AVX-512 execution tests require compatible x86-64 hardware;
 unsupported hosts validate the fallback contract instead. CUDA compilation
 does not require a locally installed toolkit because the driver is loaded
 dynamically, while execution still requires a compatible NVIDIA device.
@@ -64,3 +64,6 @@ See [API.md](API.md) for the stable boundary and
 [BENCHMARKING.md](BENCHMARKING.md) for the qualification protocol.
 Upstream source and license attribution is retained in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Part of Daniel Hopp's portfolio: https://daniel.hoppworks.de/work/vestra/ ·
+https://www.linkedin.com/in/hoppworks
