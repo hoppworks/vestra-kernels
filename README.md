@@ -65,5 +65,5 @@ See [API.md](API.md) for the stable boundary and
 Upstream source and license attribution is retained in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-Part of Daniel Hopp's portfolio: https://daniel.hoppworks.de/work/vestra/ ·
+Part of Daniel Hopp's portfolio: https://hoppworks.de/work/vestra/ ·
 https://www.linkedin.com/in/hoppworks
